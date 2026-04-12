@@ -25,6 +25,11 @@ chip_data_model("evse-common") {
   is_server = true
 }
 
+chip_data_model("phase2-energy-simulator-common") {
+  zap_file = "phase2-energy-simulator.zap"
+  is_server = true
+}
+
 source_set("evse-common-lib") {
   sources = [
     "src/ChargingTargetsMemMgr.cpp",

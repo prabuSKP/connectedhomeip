@@ -17,12 +17,16 @@
 
 #include <MeterIdentificationInstance.h>
 #include <app/util/af-types.h>
+#include <lib/support/CodeUtils.h>
+
+#include <memory>
 
 using namespace chip::app::Clusters;
 using namespace chip::app::Clusters::MeterIdentification;
 
 namespace {
 static std::unique_ptr<Instance> gMeterIdentificationCluster;
+static chip::EndpointId gMeterIdentificationEndpoint = chip::kInvalidEndpointId;
 } // namespace
 
 Instance * MeterIdentification::GetInstance()
@@ -30,20 +34,47 @@ Instance * MeterIdentification::GetInstance()
     return gMeterIdentificationCluster.get();
 }
 
-void emberAfMeterIdentificationClusterInitCallback(chip::EndpointId endpointId)
+CHIP_ERROR MeterIdentificationInit(chip::EndpointId endpointId)
 {
-    VerifyOrDie(endpointId == 1); // this cluster is only enabled for endpoint 1.
-    VerifyOrDie(gMeterIdentificationCluster == nullptr);
+    if (gMeterIdentificationCluster)
+    {
+        return (gMeterIdentificationEndpoint == endpointId) ? CHIP_NO_ERROR : CHIP_ERROR_INCORRECT_STATE;
+    }
+
     gMeterIdentificationCluster =
         std::make_unique<Instance>(endpointId, chip::BitMask<Feature, uint32_t>(Feature::kPowerThreshold));
-    TEMPORARY_RETURN_IGNORED gMeterIdentificationCluster->Init();
+    VerifyOrReturnError(gMeterIdentificationCluster != nullptr, CHIP_ERROR_NO_MEMORY);
+
+    CHIP_ERROR err = gMeterIdentificationCluster->Init();
+    if (err != CHIP_NO_ERROR)
+    {
+        gMeterIdentificationCluster.reset();
+        return err;
+    }
+
+    gMeterIdentificationEndpoint = endpointId;
+    return CHIP_NO_ERROR;
 }
 
-void emberAfMeterIdentificationClusterShutdownCallback(chip::EndpointId endpointId)
+CHIP_ERROR MeterIdentificationShutdown()
 {
     if (gMeterIdentificationCluster)
     {
         gMeterIdentificationCluster->Shutdown();
         gMeterIdentificationCluster.reset(nullptr);
+        gMeterIdentificationEndpoint = chip::kInvalidEndpointId;
     }
+
+    return CHIP_NO_ERROR;
+}
+
+void emberAfMeterIdentificationClusterInitCallback(chip::EndpointId endpointId)
+{
+    VerifyOrDie(MeterIdentificationInit(endpointId) == CHIP_NO_ERROR);
+}
+
+void emberAfMeterIdentificationClusterShutdownCallback(chip::EndpointId endpointId)
+{
+    VerifyOrReturn(gMeterIdentificationEndpoint == endpointId || gMeterIdentificationEndpoint == chip::kInvalidEndpointId);
+    TEMPORARY_RETURN_IGNORED MeterIdentificationShutdown();
 }
