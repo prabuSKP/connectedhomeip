@@ -35,7 +35,10 @@
 #include <lib/core/Optional.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
+#include <platform/CHIPDeviceLayer.h>
 
+#include <cstdlib>
+#include <ctime>
 #include <memory>
 
 using namespace chip;
@@ -52,6 +55,12 @@ namespace {
 constexpr EndpointId kElectricalSensorEndpoint = 1;
 constexpr EndpointId kDemEndpoint              = 2;
 constexpr EndpointId kElectricalMeterEndpoint  = 3;
+
+constexpr uint32_t kTelemetryIntervalSec = 10;
+
+// Telemetry state — accumulates over time
+int64_t sSensorCumulativeEnergyMwh = 45'000'000; // 45 kWh
+int64_t sMeterCumulativeEnergyMwh  = 52'000'000; // 52 kWh
 
 const ElectricalEnergyMeasurement::Structs::MeasurementAccuracyRangeStruct::Type kMeasurementAccuracyRanges[] = {
     { .rangeMin   = 0,
@@ -210,6 +219,57 @@ void ShutdownElectricalMeasurementRuntime(ElectricalMeasurementRuntime & runtime
     TEMPORARY_RETURN_IGNORED ElectricalPowerMeasurementShutdown(runtime.epmInstance, runtime.epmDelegate);
 }
 
+int64_t RandomVariation(int64_t base, int64_t halfRange)
+{
+    return base + (std::rand() % (2 * halfRange + 1)) - halfRange;
+}
+
+void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId endpoint,
+                            int64_t baseVoltageMv, int64_t baseCurrentMa, int64_t basePowerMw,
+                            int64_t & cumulativeEnergyMwh)
+{
+    if (runtime.epmDelegate == nullptr)
+        return;
+
+    int64_t voltage = RandomVariation(baseVoltageMv, 5'000);  // ±5 V
+    int64_t current = RandomVariation(baseCurrentMa, 500);    // ±0.5 A
+    int64_t power   = RandomVariation(basePowerMw, 100'000);  // ±100 W
+
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetVoltage(Nullable<int64_t>(voltage));
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActiveCurrent(Nullable<int64_t>(current));
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActivePower(Nullable<int64_t>(power));
+
+    MatterReportingAttributeChangeCallback(endpoint, ElectricalPowerMeasurement::Id,
+                                           ElectricalPowerMeasurement::Attributes::Voltage::Id);
+    MatterReportingAttributeChangeCallback(endpoint, ElectricalPowerMeasurement::Id,
+                                           ElectricalPowerMeasurement::Attributes::ActiveCurrent::Id);
+    MatterReportingAttributeChangeCallback(endpoint, ElectricalPowerMeasurement::Id,
+                                           ElectricalPowerMeasurement::Attributes::ActivePower::Id);
+
+    // Accumulate energy: E = P × t / 3600 (mWh)
+    int64_t energyIncrementMwh = (power * static_cast<int64_t>(kTelemetryIntervalSec)) / 3600;
+    cumulativeEnergyMwh += energyIncrementMwh;
+
+    SeedElectricalEnergyValues(endpoint, cumulativeEnergyMwh, energyIncrementMwh);
+}
+
+void TelemetryTimerHandler(chip::System::Layer * /*layer*/, void * /*appState*/)
+{
+    ChipLogDetail(AppServer, "Phase 2 Telemetry: tick (sensor cumE=%.1f kWh, meter cumE=%.1f kWh)",
+                  static_cast<double>(sSensorCumulativeEnergyMwh) / 1'000'000.0,
+                  static_cast<double>(sMeterCumulativeEnergyMwh) / 1'000'000.0);
+
+    UpdateEndpointTelemetry(gElectricalSensor, kElectricalSensorEndpoint,
+                            230'000, 6'500, 1'500'000, sSensorCumulativeEnergyMwh);
+    UpdateEndpointTelemetry(gElectricalMeter, kElectricalMeterEndpoint,
+                            230'000, 8'000, 1'840'000, sMeterCumulativeEnergyMwh);
+
+    // Reschedule
+    chip::DeviceLayer::SystemLayer().StartTimer(
+        chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
+        TelemetryTimerHandler, nullptr);
+}
+
 } // namespace
 
 void emberAfElectricalEnergyMeasurementClusterInitCallback(chip::EndpointId endpointId)
@@ -247,11 +307,21 @@ void Phase2EnergySimulatorInit()
     VerifyOrDie(InitElectricalSensorEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitDemEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitElectricalMeterEndpoint() == CHIP_NO_ERROR);
+
+    // Start telemetry timer for dynamic attribute updates
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    chip::DeviceLayer::SystemLayer().StartTimer(
+        chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
+        TelemetryTimerHandler, nullptr);
+    ChipLogDetail(AppServer, "Phase 2 Energy Simulator: Telemetry timer started (%u sec interval)", kTelemetryIntervalSec);
 }
 
 void Phase2EnergySimulatorShutdown()
 {
     ChipLogDetail(AppServer, "Phase 2 Energy Simulator: Shutdown");
+
+    // Cancel telemetry timer
+    chip::DeviceLayer::SystemLayer().CancelTimer(TelemetryTimerHandler, nullptr);
 
     TEMPORARY_RETURN_IGNORED MeterIdentificationShutdown();
     TEMPORARY_RETURN_IGNORED CommodityMeteringShutdown();
