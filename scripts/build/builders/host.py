@@ -87,6 +87,7 @@ class HostApp(Enum):
     NETWORK_MANAGER = auto()
     ENERGY_GATEWAY = auto()
     ENERGY_MANAGEMENT = auto()
+    PHASE2_ENERGY_SIMULATOR = auto()
     WATER_LEAK_DETECTOR = auto()
     TERMS_AND_CONDITIONS = auto()
     CAMERA = auto()
@@ -189,6 +190,8 @@ class HostApp(Enum):
         elif self == HostApp.ENERGY_GATEWAY:
             return 'energy-gateway-app/linux'
         elif self == HostApp.ENERGY_MANAGEMENT:
+            return 'energy-management-app/linux'
+        elif self == HostApp.PHASE2_ENERGY_SIMULATOR:
             return 'energy-management-app/linux'
         elif self == HostApp.WATER_LEAK_DETECTOR:
             return 'water-leak-detector-app/linux'
@@ -322,6 +325,9 @@ class HostApp(Enum):
         elif self == HostApp.ENERGY_MANAGEMENT:
             yield 'chip-energy-management-app'
             yield 'chip-energy-management-app.map'
+        elif self == HostApp.PHASE2_ENERGY_SIMULATOR:
+            yield 'chip-phase2-energy-simulator-app'
+            yield 'chip-phase2-energy-simulator-app.map'
         elif self == HostApp.WATER_LEAK_DETECTOR:
             yield 'water-leak-detector-app'
             yield 'water-leak-detector-app.map'

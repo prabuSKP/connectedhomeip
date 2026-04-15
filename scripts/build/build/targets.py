@@ -145,6 +145,7 @@ def BuildHostTarget():
         TargetPart('network-manager', app=HostApp.NETWORK_MANAGER),
         TargetPart('energy-gateway', app=HostApp.ENERGY_GATEWAY),
         TargetPart('energy-management', app=HostApp.ENERGY_MANAGEMENT),
+        TargetPart('phase2-energy-simulator', app=HostApp.PHASE2_ENERGY_SIMULATOR),
         TargetPart('water-leak-detector', app=HostApp.WATER_LEAK_DETECTOR),
         TargetPart('terms-and-conditions', app=HostApp.TERMS_AND_CONDITIONS),
         TargetPart('camera', app=HostApp.CAMERA),
