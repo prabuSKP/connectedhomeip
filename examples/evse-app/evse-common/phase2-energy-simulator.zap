@@ -2762,16 +2762,16 @@
       "deviceTypeRef": {
         "code": 1296,
         "profileId": 259,
-        "label": "Electrical Sensor",
-        "name": "Electrical Sensor",
+        "label": "MA-electricalsensor",
+        "name": "MA-electricalsensor",
         "deviceTypeOrder": 0
       },
       "deviceTypes": [
         {
           "code": 1296,
           "profileId": 259,
-          "label": "Electrical Sensor",
-          "name": "Electrical Sensor",
+          "label": "MA-electricalsensor",
+          "name": "MA-electricalsensor",
           "deviceTypeOrder": 0
         }
       ],
@@ -2781,7 +2781,7 @@
       "deviceIdentifiers": [
         1296
       ],
-      "deviceTypeName": "Electrical Sensor",
+      "deviceTypeName": "MA-electricalsensor",
       "deviceTypeCode": 1296,
       "deviceTypeProfileId": 259,
       "clusters": [
@@ -4554,16 +4554,16 @@
       "deviceTypeRef": {
         "code": 1300,
         "profileId": 259,
-        "label": "Electrical Meter",
-        "name": "Electrical Meter",
+        "label": "MA-electrical-meter",
+        "name": "MA-electrical-meter",
         "deviceTypeOrder": 0
       },
       "deviceTypes": [
         {
           "code": 1300,
           "profileId": 259,
-          "label": "Electrical Meter",
-          "name": "Electrical Meter",
+          "label": "MA-electrical-meter",
+          "name": "MA-electrical-meter",
           "deviceTypeOrder": 0
         }
       ],
@@ -4573,7 +4573,7 @@
       "deviceIdentifiers": [
         1300
       ],
-      "deviceTypeName": "Electrical Meter",
+      "deviceTypeName": "MA-electrical-meter",
       "deviceTypeCode": 1300,
       "deviceTypeProfileId": 259,
       "clusters": [
@@ -5630,16 +5630,16 @@
       "deviceTypeRef": {
         "code": 1297,
         "profileId": 259,
-        "label": "Electrical Utility Meter",
-        "name": "Electrical Utility Meter",
+        "label": "MA-electrical-utility-meter",
+        "name": "MA-electrical-utility-meter",
         "deviceTypeOrder": 0
       },
       "deviceTypes": [
         {
           "code": 1297,
           "profileId": 259,
-          "label": "Electrical Utility Meter",
-          "name": "Electrical Utility Meter",
+          "label": "MA-electrical-utility-meter",
+          "name": "MA-electrical-utility-meter",
           "deviceTypeOrder": 0
         }
       ],
@@ -5649,7 +5649,7 @@
       "deviceIdentifiers": [
         1297
       ],
-      "deviceTypeName": "Electrical Utility Meter",
+      "deviceTypeName": "MA-electrical-utility-meter",
       "deviceTypeCode": 1297,
       "deviceTypeProfileId": 259,
       "clusters": [

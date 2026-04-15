@@ -29,6 +29,7 @@
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/clusters/electrical-energy-measurement-server/CodegenIntegration.h>
+#include <app/clusters/energy-evse-server/EnergyEvseTestEventTriggerHandler.h>
 #include <app/data-model/Nullable.h>
 #include <app/reporting/reporting.h>
 #include <device-energy-management-modes.h>
@@ -331,6 +332,18 @@ void Phase2EnergySimulatorShutdown()
     DeviceEnergyManagementShutdown(gDem.demInstance, gDem.demDelegate);
 
     Clusters::DeviceEnergyManagementMode::Shutdown();
+}
+
+DeviceEnergyManagement::DeviceEnergyManagementDelegate * GetDEMDelegate()
+{
+    VerifyOrDieWithMsg(gDem.demDelegate.get() != nullptr, AppServer, "DEM Delegate is null");
+    return gDem.demDelegate.get();
+}
+
+bool HandleEnergyEvseTestEventTrigger(uint64_t)
+{
+    // Phase 2 simulator does not expose an Energy EVSE endpoint.
+    return false;
 }
 
 EndpointId GetIdentifyEndpointId()

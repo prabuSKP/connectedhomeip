@@ -120,8 +120,9 @@ executable("chip-phase2-energy-simulator-app") {
   ]
 
   deps = [
+    "${chip_root}/examples/energy-management/energy-management-triggers:tests-event-triggers",
     "${chip_root}/examples/evse-app/evse-common:evse-common-lib",
-    "${chip_root}/examples/evse-app/evse-common:phase2-energy-simulator-common",
+    "${chip_root}/examples/evse-app/evse-common/phase2:phase2-energy-simulator-common",
     "${chip_root}/examples/platform/linux:app-main",
     "${chip_root}/src/app:attribute-persistence",
     "${chip_root}/src/lib",

@@ -201,6 +201,10 @@ We welcome your contributions to Matter. Read our contribution guidelines
 
 Instructions about how to build Matter can be found [here](./docs/README.md) .
 
+For Linux setup, clean build, and runtime instructions for the Phase 2 virtual
+energy simulator app, see
+[docs/platforms/linux/phase2_virtual_energy_simulator.md](./docs/platforms/linux/phase2_virtual_energy_simulator.md).
+
 # Directory Structure
 
 The Matter repository is structured as follows:
