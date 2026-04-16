@@ -134,3 +134,19 @@ Then re-run the app command.
 ```
 
 Use `chip-tool` to commission and test the running virtual app.
+
+## 11. Run Automated Smoke Test (Recommended)
+
+To run a beginner-friendly request/response smoke test flow, use:
+
+```bash
+./scripts/tools/phase2_energy_simulator_smoke.sh \
+  --recommission \
+  --pair-timeout 30 \
+  --check-timeout 5 \
+  --response-lines 6
+```
+
+For step-by-step explanation of each test and how to interpret output, see:
+
+- [Phase 2 Energy Simulator Smoke Test Guide](./phase2_energy_smoke_test_guide.md)
