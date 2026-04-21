@@ -123,6 +123,7 @@ executable("chip-phase2-energy-simulator-app") {
     "${chip_root}/examples/energy-management/energy-management-triggers:tests-event-triggers",
     "${chip_root}/examples/evse-app/evse-common:evse-common-lib",
     "${chip_root}/examples/evse-app/evse-common/phase2:phase2-energy-simulator-common",
+    "${chip_root}/examples/evse-app/evse-common/phase2:phase2-energy-simulator-common-lib",
     "${chip_root}/examples/platform/linux:app-main",
     "${chip_root}/src/app:attribute-persistence",
     "${chip_root}/src/lib",
@@ -132,6 +133,8 @@ executable("chip-phase2-energy-simulator-app") {
     "include",
     "${chip_root}/examples/evse-app/evse-common/include",
     "${chip_root}/examples/energy-gateway-app/commodity-metering/include",
+    "${chip_root}/examples/energy-gateway-app/commodity-price/include",
+    "${chip_root}/examples/energy-gateway-app/commodity-tariff/include",
     "${chip_root}/examples/energy-gateway-app/meter-identification/include",
   ]
 

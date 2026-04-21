@@ -1,7 +1,4 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
@@ -164,7 +161,9 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/out/${input:outPWFuzzTestLinux}",
-            "args": ["-fuzz=${input:fuzzTestName}"],
+            "args": [
+                "-fuzz=${input:fuzzTestName}"
+            ],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": ""
         },
@@ -273,7 +272,10 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/out/debug/standalone/fabric-admin",
-            "args": ["--log-file-path", "/tmp/fabric_admin.log"],
+            "args": [
+                "--log-file-path",
+                "/tmp/fabric_admin.log"
+            ],
             "cwd": "${workspaceFolder}"
         },
         {
@@ -401,7 +403,9 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/out/nrf-native-sim-tests/nrfconnect/zephyr/zephyr.exe",
-            "args": ["-testargs"],
+            "args": [
+                "-testargs"
+            ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/out/nrf-native-sim-tests/nrfconnect",
             "environment": [],
@@ -449,6 +453,32 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/controller/tests/out/test/tests/TestCommands",
             "cwd": "${workspaceFolder}/src/controller/tests/out/test/tests"
+        },
+        {
+            "name": "C/C++: g++ build and debug active file",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "C/C++: g++ build active file",
+            "miDebuggerPath": "/usr/bin/gdb"
         }
     ],
     "inputs": [

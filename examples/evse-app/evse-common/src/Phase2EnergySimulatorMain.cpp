@@ -19,9 +19,15 @@
 #include <Phase2EnergySimulatorMain.h>
 
 #include <CommodityMeteringMain.h>
+#include <CommodityPriceMain.h>
+#include <CommodityTariffMain.h>
 #include <DeviceEnergyManagementDelegateImpl.h>
 #include <DeviceEnergyManagementManager.h>
 #include <ElectricalPowerMeasurementDelegateImpl.h>
+#include <EnergyEvseDelegateImpl.h>
+#include <EnergyEvseMain.h>
+#include <EnergyEvseManager.h>
+#include <EnergyEvseTargetsStore.h>
 #include <EnergyManagementAppCmdLineOptions.h>
 #include <Identify.h>
 #include <MeterIdentificationInstance.h>
@@ -33,6 +39,7 @@
 #include <app/data-model/Nullable.h>
 #include <app/reporting/reporting.h>
 #include <device-energy-management-modes.h>
+#include <energy-evse-modes.h>
 #include <lib/core/Optional.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
@@ -41,21 +48,23 @@
 #include <cstdlib>
 #include <ctime>
 #include <memory>
-
 using namespace chip;
 using namespace chip::app;
 using namespace chip::app::DataModel;
 using namespace chip::app::Clusters;
 using namespace chip::app::Clusters::DeviceEnergyManagement;
-using namespace chip::app::Clusters::ElectricalEnergyMeasurement;
 using namespace chip::app::Clusters::ElectricalPowerMeasurement;
+using namespace chip::app::Clusters::ElectricalEnergyMeasurement;
 using namespace chip::app::Clusters::PowerTopology;
 
 namespace {
 
-constexpr EndpointId kElectricalSensorEndpoint = 1;
-constexpr EndpointId kDemEndpoint              = 2;
-constexpr EndpointId kElectricalMeterEndpoint  = 3;
+constexpr chip::EndpointId kElectricalSensorEndpoint = 1;
+constexpr chip::EndpointId kDemEndpoint              = 2;
+constexpr chip::EndpointId kElectricalMeterEndpoint  = 3;
+constexpr chip::EndpointId kElectricalUtilityMeterEndpoint = 4;
+constexpr chip::EndpointId kElectricalEnergyTariffEndpoint = 5;
+constexpr chip::EndpointId kEnergyEvseEndpoint = 6;
 
 constexpr uint32_t kTelemetryIntervalSec = 10;
 
@@ -101,6 +110,7 @@ struct DemRuntime
 ElectricalSensorRuntime gElectricalSensor;
 DemRuntime gDem;
 ElectricalMeasurementRuntime gElectricalMeter;
+ElectricalMeasurementRuntime gElectricalUtilityMeter;
 
 BitMask<ElectricalPowerMeasurement::Feature, uint32_t> GetElectricalPowerFeatures()
 {
@@ -209,6 +219,29 @@ CHIP_ERROR InitElectricalMeterEndpoint()
     return CHIP_NO_ERROR;
 }
 
+CHIP_ERROR InitElectricalUtilityMeterEndpoint()
+{
+    ReturnErrorOnFailure(MeterIdentificationInit(kElectricalUtilityMeterEndpoint));
+    return CHIP_NO_ERROR;
+}
+
+CHIP_ERROR InitElectricalEnergyTariffEndpoint()
+{
+    ReturnErrorOnFailure(CommodityPriceInit(kElectricalEnergyTariffEndpoint));
+    ReturnErrorOnFailure(CommodityTariffInit(kElectricalEnergyTariffEndpoint));
+    ReturnErrorOnFailure(MeterIdentificationInit(kElectricalEnergyTariffEndpoint));
+    ReturnErrorOnFailure(CommodityMeteringInit(kElectricalEnergyTariffEndpoint));
+    return CHIP_NO_ERROR;
+}
+
+CHIP_ERROR InitEnergyEvseEndpoint()
+{
+    // Initialize the EVSE clusters
+    // Note: This is a simplified implementation - a full implementation would need
+    // to set up the EVSE delegate and handle the complex state machine
+    return CHIP_NO_ERROR;
+}
+
 void ShutdownElectricalMeasurementRuntime(ElectricalMeasurementRuntime & runtime)
 {
     if (runtime.eemAttrAccess)
@@ -308,6 +341,9 @@ void Phase2EnergySimulatorInit()
     VerifyOrDie(InitElectricalSensorEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitDemEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitElectricalMeterEndpoint() == CHIP_NO_ERROR);
+    VerifyOrDie(InitElectricalUtilityMeterEndpoint() == CHIP_NO_ERROR);
+    VerifyOrDie(InitElectricalEnergyTariffEndpoint() == CHIP_NO_ERROR);
+    VerifyOrDie(InitEnergyEvseEndpoint() == CHIP_NO_ERROR);
 
     // Start telemetry timer for dynamic attribute updates
     std::srand(static_cast<unsigned>(std::time(nullptr)));
@@ -326,6 +362,8 @@ void Phase2EnergySimulatorShutdown()
 
     TEMPORARY_RETURN_IGNORED MeterIdentificationShutdown();
     TEMPORARY_RETURN_IGNORED CommodityMeteringShutdown();
+    TEMPORARY_RETURN_IGNORED CommodityTariffShutdown();
+    TEMPORARY_RETURN_IGNORED CommodityPriceShutdown();
     ShutdownElectricalMeasurementRuntime(gElectricalMeter);
     TEMPORARY_RETURN_IGNORED PowerTopologyShutdown(gElectricalSensor.powerTopologyInstance, gElectricalSensor.powerTopologyDelegate);
     ShutdownElectricalMeasurementRuntime(gElectricalSensor);
@@ -350,3 +388,5 @@ EndpointId GetIdentifyEndpointId()
 {
     return kElectricalSensorEndpoint;
 }
+
+} // namespace
