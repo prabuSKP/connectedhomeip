@@ -1,46 +1,61 @@
 # Phase 2 Virtual Energy Simulator Extension
 
 ## Overview
-This document provides information about the extended Phase 2 Virtual Energy Simulator, which now supports all electrical device types and clusters defined in the Matter specification, along with a comprehensive testing script.
+This document describes the Phase 2 Virtual Energy Simulator that exposes the
+electrical device types supported by the `phase2-energy-simulator.zap` data
+model, along with a comprehensive testing script that covers every cluster on
+every endpoint.
 
-## Extended Device Types Support
+## Supported Device Types and Endpoints
 
-The extended Phase 2 Virtual Energy Simulator now supports the following device types:
+The Phase 2 Virtual Energy Simulator publishes the following endpoints:
 
-1. **Endpoint 0**: Root Node Device (MA-rootdevice)
-2. **Endpoint 1**: Electrical Sensor (MA-electricalsensor)
-3. **Endpoint 2**: Device Energy Management
-4. **Endpoint 3**: Electrical Meter (MA-electrical-meter)
-5. **Endpoint 4**: Electrical Utility Meter (MA-electrical-utility-meter)
-6. **Endpoint 5**: Electrical Energy Tariff Device (MA-electrical-energy-tariff)
-7. **Endpoint 6**: Energy EVSE Device (Energy EVSE)
+| Endpoint | Device type                       | Server clusters                                                                                   |
+|---------:|-----------------------------------|---------------------------------------------------------------------------------------------------|
+| 0        | MA-rootdevice (+ OTA requestor)   | Descriptor, Access Control, Basic Information, OTA Requestor, and other standard root clusters   |
+| 1        | MA-electricalsensor               | Identify, Descriptor, ElectricalPowerMeasurement, ElectricalEnergyMeasurement, PowerTopology      |
+| 2        | Device Energy Management (1293)   | Identify, Descriptor, DeviceEnergyManagement, DeviceEnergyManagementMode                          |
+| 3        | MA-electrical-meter               | Identify, Descriptor, ElectricalPowerMeasurement, ElectricalEnergyMeasurement, CommodityMetering  |
+| 4        | MA-electrical-utility-meter       | Identify, Descriptor, MeterIdentification                                                         |
 
-## Extended Clusters Support
+## Extending to Additional Device Types
 
-In addition to the previously supported clusters, the simulator now also supports:
+The plan document (`phase2_energy_simulator_extension_plan.md`) outlines two
+additional endpoints (MA-electrical-energy-tariff and Energy EVSE). Adding them
+requires regenerating `phase2-energy-simulator.matter` from the ZAP file with
+the ZAP tool:
 
-- **Commodity Price** (Cluster ID: 149)
-- **Commodity Tariff** (Cluster ID: 1792)
-- **Energy EVSE** (Cluster ID: 153)
-- **Energy EVSE Mode** (Cluster ID: 157)
+```bash
+./scripts/tools/zap/generate.py examples/evse-app/evse-common/phase2-energy-simulator.zap \
+    -o examples/evse-app/evse-common/
+```
+
+Once the matter file contains the new endpoints (and the corresponding entries
+are added back to `Phase2EnergySimulatorMain.cpp` / the build graph), the
+Commodity Price, Commodity Tariff, Energy EVSE, and Energy EVSE Mode clusters
+can be re-enabled. The ZAP regeneration step has not been run in this change
+because `zap-cli` is not available in the current build environment; the ZAP
+and matter files are therefore kept in lockstep at five endpoints so that the
+simulator compiles cleanly.
 
 ## Implementation Files
 
-- **ZAP Configuration**: `examples/evse-app/evse-common/phase2-energy-simulator.zap`
-- **Extension Plan**: `phase2_energy_simulator_extension_plan.md`
-- **Comprehensive Test Script**: `scripts/tools/phase2_energy_simulator_comprehensive_test.sh`
+- **ZAP configuration**: `examples/evse-app/evse-common/phase2-energy-simulator.zap`
+- **Matter IDL**: `examples/evse-app/evse-common/phase2-energy-simulator.matter`
+- **Application entry point**: `examples/evse-app/evse-common/src/Phase2EnergySimulatorMain.cpp`
+- **Linux main**: `examples/evse-app/linux/phase2_main.cpp`
+- **Build graph**: `examples/evse-app/evse-common/phase2/BUILD.gn`, `examples/evse-app/linux/BUILD.gn`
+- **Smoke test script**: `scripts/tools/phase2_energy_simulator_smoke.sh`
+- **Comprehensive test script**: `scripts/tools/phase2_energy_simulator_comprehensive_test.sh`
+- **Extension plan**: `phase2_energy_simulator_extension_plan.md`
 
-## Building the Extended Simulator
-
-To build the extended Phase 2 Virtual Energy Simulator:
+## Building the Simulator
 
 ```bash
 ./scripts/build/build_examples.py --target linux-x64-phase2-energy-simulator build
 ```
 
-## Running the Extended Simulator
-
-To run the extended simulator:
+## Running the Simulator
 
 ```bash
 ./out/linux-x64-phase2-energy-simulator/chip-phase2-energy-simulator-app \
@@ -51,63 +66,66 @@ To run the extended simulator:
   --enable-key 000102030405060708090a0b0c0d0e0f
 ```
 
-## Comprehensive Testing Script
+## Comprehensive Test Script
 
-A new comprehensive testing script has been created to test all device types and clusters:
+`scripts/tools/phase2_energy_simulator_comprehensive_test.sh` exercises every
+cluster on every endpoint exposed by the simulator. Each test is reported with
+PASS/FAIL status and totals are printed at the end.
 
-### Location
-`scripts/tools/phase2_energy_simulator_comprehensive_test.sh`
+### Test suites
 
-### Features
-- Modular design with separate test suites for each device type
-- Configurable parameters for node ID, passcode, discriminator, etc.
-- Detailed reporting with PASS/FAIL status for each test
-- Flexible execution options to run specific test suites or all tests
-- Robust error handling with meaningful error messages
-- Detailed logging to file for debugging purposes
+| Suite                 | Target endpoint | Cluster(s) exercised                                              |
+|-----------------------|-----------------|-------------------------------------------------------------------|
+| device-discovery      | all             | Descriptor `parts-list`, `server-list`, `device-type-list`        |
+| basic-information     | 0               | Basic Information attributes (vendor/product/software/unique id)  |
+| electrical-sensor     | 1               | ElectricalPowerMeasurement, ElectricalEnergyMeasurement           |
+| power-topology        | 1               | PowerTopology attributes                                          |
+| dem                   | 2               | DeviceEnergyManagement attributes                                 |
+| dem-mode              | 2               | DeviceEnergyManagementMode attributes                             |
+| electrical-meter      | 3               | ElectricalPowerMeasurement, ElectricalEnergyMeasurement           |
+| commodity-metering    | 3               | CommodityMetering attributes                                      |
+| utility-meter         | 4               | Descriptor layout for the utility meter device type               |
+| meter-identification  | 4               | MeterIdentification attributes                                    |
 
-### Usage Examples
+The `all` suite (default) runs every suite above in order.
 
-Run all tests:
+### Usage examples
+
+Run every suite:
+
 ```bash
 ./scripts/tools/phase2_energy_simulator_comprehensive_test.sh
 ```
 
 Run with recommissioning:
+
 ```bash
 ./scripts/tools/phase2_energy_simulator_comprehensive_test.sh --recommission
 ```
 
-Run specific test suite:
+Run a single suite:
+
 ```bash
-./scripts/tools/phase2_energy_simulator_comprehensive_test.sh --test-suite electrical-sensor
+./scripts/tools/phase2_energy_simulator_comprehensive_test.sh --test-suite commodity-metering
 ```
 
-Run with custom parameters:
+Run with custom identity:
+
 ```bash
-./scripts/tools/phase2_energy_simulator_comprehensive_test.sh --node-id 0x12345678 --passcode 30303030 --discriminator 3841
+./scripts/tools/phase2_energy_simulator_comprehensive_test.sh \
+  --node-id 0x12345678 --passcode 30303030 --discriminator 3841
 ```
 
-### Available Test Suites
-- `all`: Run all test suites (default)
-- `device-discovery`: Device discovery tests
-- `electrical-sensor`: Electrical sensor tests
-- `dem`: Device energy management tests
-- `electrical-meter`: Electrical meter tests
-- `utility-meter`: Electrical utility meter tests
-- `commodity-price`: Commodity price tests
-- `commodity-tariff`: Commodity tariff tests
-- `evse`: Energy EVSE tests
+### Command-line options
 
-### Command Line Options
 ```
 --node-id <id>              Node ID to use (default: 0x12344321)
 --passcode <code>           Setup passcode (default: 20202021)
 --discriminator <disc>      Setup discriminator (default: 3840)
 --pairing-mode <mode>       Pairing mode: onnetwork-long | onnetwork | code | skip
---qr-payload <payload>      QR payload/manual code for pairing mode code
+--qr-payload <payload>      QR payload / manual code for --pairing-mode code
 --recommission              Unpair the node before pairing
---test-suite <suite>        Run specific test suite
+--test-suite <suite>        Run specific test suite (see table above)
 --verbose                   Enable verbose output
 --log-file <file>           Log file path (default: /tmp/phase2-comprehensive-test.log)
 --timeout <seconds>         Timeout for each test (default: 30)
@@ -115,26 +133,10 @@ Run with custom parameters:
 -h, --help                  Show help
 ```
 
-## Benefits of the Extension
-
-1. **Complete Coverage**: Support for all electrical device types and clusters defined in the Matter specification
-2. **Comprehensive Testing**: Detailed test script covering all functionality with granular test suites
-3. **Modular Design**: Easy to extend and maintain with separate functions for each device type testing
-4. **Industry Standard Compliance**: Full adherence to Matter specification for energy management
-5. **Developer Friendly**: Clear documentation, examples, and configurable parameters
-6. **Robust Testing**: Comprehensive error handling, detailed reporting, and logging capabilities
-
 ## Integration with Existing Tools
 
-The extended simulator maintains compatibility with existing tools and scripts:
-- The original smoke test script (`scripts/tools/phase2_energy_simulator_smoke.sh`) continues to work
-- All existing chip-tool commands remain functional
-- The build process is unchanged
-
-## Future Enhancements
-
-Potential future enhancements include:
-- Adding support for additional energy-related device types
-- Implementing more sophisticated simulation logic for each cluster
-- Adding support for more complex command sequences and scenarios
-- Enhancing the testing script with performance and stress testing capabilities
+- `scripts/tools/phase2_energy_simulator_smoke.sh` remains a lightweight smoke
+  check that also covers the five endpoints above.
+- `chip-tool` commands against the simulator are unchanged.
+- The build process is unchanged aside from the smaller dependency graph for
+  `chip-phase2-energy-simulator-app`.

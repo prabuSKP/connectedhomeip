@@ -19,15 +19,9 @@
 #include <Phase2EnergySimulatorMain.h>
 
 #include <CommodityMeteringMain.h>
-#include <CommodityPriceMain.h>
-#include <CommodityTariffMain.h>
 #include <DeviceEnergyManagementDelegateImpl.h>
 #include <DeviceEnergyManagementManager.h>
 #include <ElectricalPowerMeasurementDelegateImpl.h>
-#include <EnergyEvseDelegateImpl.h>
-#include <EnergyEvseMain.h>
-#include <EnergyEvseManager.h>
-#include <EnergyEvseTargetsStore.h>
 #include <EnergyManagementAppCmdLineOptions.h>
 #include <Identify.h>
 #include <MeterIdentificationInstance.h>
@@ -35,11 +29,9 @@
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/clusters/electrical-energy-measurement-server/CodegenIntegration.h>
-#include <app/clusters/energy-evse-server/EnergyEvseTestEventTriggerHandler.h>
 #include <app/data-model/Nullable.h>
 #include <app/reporting/reporting.h>
 #include <device-energy-management-modes.h>
-#include <energy-evse-modes.h>
 #include <lib/core/Optional.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
@@ -48,6 +40,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <memory>
+
 using namespace chip;
 using namespace chip::app;
 using namespace chip::app::DataModel;
@@ -59,12 +52,10 @@ using namespace chip::app::Clusters::PowerTopology;
 
 namespace {
 
-constexpr chip::EndpointId kElectricalSensorEndpoint = 1;
-constexpr chip::EndpointId kDemEndpoint              = 2;
-constexpr chip::EndpointId kElectricalMeterEndpoint  = 3;
+constexpr chip::EndpointId kElectricalSensorEndpoint       = 1;
+constexpr chip::EndpointId kDemEndpoint                    = 2;
+constexpr chip::EndpointId kElectricalMeterEndpoint        = 3;
 constexpr chip::EndpointId kElectricalUtilityMeterEndpoint = 4;
-constexpr chip::EndpointId kElectricalEnergyTariffEndpoint = 5;
-constexpr chip::EndpointId kEnergyEvseEndpoint = 6;
 
 constexpr uint32_t kTelemetryIntervalSec = 10;
 
@@ -107,31 +98,9 @@ struct DemRuntime
     std::unique_ptr<DeviceEnergyManagementManager> demInstance;
 };
 
-struct EvseRuntime
-{
-    std::unique_ptr<EvseTargetsDelegate> targetsDelegate;
-    std::unique_ptr<EnergyEvseDelegate> delegate;
-    std::unique_ptr<EnergyEvseManager> instance;
-};
-
-struct EvseTestEventSaveData
-{
-    int64_t oldMaxHardwareChargeCurrentLimit    = 0;
-    int64_t oldMaxHardwareDischargeCurrentLimit = 0;
-    int64_t oldCircuitCapacity                  = 0;
-    int64_t oldUserMaximumChargeCurrent         = 0;
-    int64_t oldCableAssemblyLimit               = 0;
-    EnergyEvse::StateEnum oldStateBasic         = EnergyEvse::StateEnum::kNotPluggedIn;
-    EnergyEvse::StateEnum oldStatePluggedIn     = EnergyEvse::StateEnum::kNotPluggedIn;
-    EnergyEvse::StateEnum oldStateDemand        = EnergyEvse::StateEnum::kNotPluggedIn;
-};
-
 ElectricalSensorRuntime gElectricalSensor;
 DemRuntime gDem;
 ElectricalMeasurementRuntime gElectricalMeter;
-ElectricalMeasurementRuntime gElectricalUtilityMeter;
-EvseRuntime gEvse;
-EvseTestEventSaveData gEvseTestEventSaveData;
 
 BitMask<ElectricalPowerMeasurement::Feature, uint32_t> GetElectricalPowerFeatures()
 {
@@ -246,49 +215,6 @@ CHIP_ERROR InitElectricalUtilityMeterEndpoint()
     return CHIP_NO_ERROR;
 }
 
-CHIP_ERROR InitElectricalEnergyTariffEndpoint()
-{
-    ReturnErrorOnFailure(CommodityPriceInit(kElectricalEnergyTariffEndpoint));
-    ReturnErrorOnFailure(CommodityTariffInit(kElectricalEnergyTariffEndpoint));
-    ReturnErrorOnFailure(MeterIdentificationInit(kElectricalEnergyTariffEndpoint));
-    ReturnErrorOnFailure(CommodityMeteringInit(kElectricalEnergyTariffEndpoint));
-    return CHIP_NO_ERROR;
-}
-
-CHIP_ERROR InitEnergyEvseEndpoint()
-{
-    VerifyOrReturnError(!gEvse.targetsDelegate && !gEvse.delegate && !gEvse.instance, CHIP_ERROR_INCORRECT_STATE);
-
-    gEvse.targetsDelegate = std::make_unique<EvseTargetsDelegate>();
-    VerifyOrReturnError(gEvse.targetsDelegate != nullptr, CHIP_ERROR_NO_MEMORY);
-
-    gEvse.delegate = std::make_unique<EnergyEvseDelegate>(*gEvse.targetsDelegate);
-    VerifyOrReturnError(gEvse.delegate != nullptr, CHIP_ERROR_NO_MEMORY);
-
-    gEvse.instance = std::make_unique<EnergyEvseManager>(
-        EndpointId(kEnergyEvseEndpoint), *gEvse.delegate,
-        BitMask<EnergyEvse::Feature, uint32_t>(EnergyEvse::Feature::kChargingPreferences, EnergyEvse::Feature::kRfid,
-                                               EnergyEvse::Feature::kSoCReporting, EnergyEvse::Feature::kPlugAndCharge,
-                                               EnergyEvse::Feature::kV2x),
-        BitMask<EnergyEvse::OptionalAttributes, uint32_t>(EnergyEvse::OptionalAttributes::kSupportsUserMaximumChargingCurrent,
-                                                          EnergyEvse::OptionalAttributes::kSupportsRandomizationWindow,
-                                                          EnergyEvse::OptionalAttributes::kSupportsApproximateEvEfficiency),
-        BitMask<EnergyEvse::OptionalCommands, uint32_t>(EnergyEvse::OptionalCommands::kSupportsStartDiagnostics));
-    VerifyOrReturnError(gEvse.instance != nullptr, CHIP_ERROR_NO_MEMORY);
-
-    ReturnErrorOnFailure(gEvse.instance->Init());
-    gEvse.delegate->SetInstance(gEvse.instance.get());
-    ReturnErrorOnFailure(gEvse.targetsDelegate->LoadTargets());
-
-    TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareChargeCurrentLimit(32000);
-    TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareDischargeCurrentLimit(32000);
-    TEMPORARY_RETURN_IGNORED gEvse.instance->SetCircuitCapacity(32000);
-    TEMPORARY_RETURN_IGNORED gEvse.instance->SetUserMaximumChargeCurrent(32000);
-    TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(EnergyEvse::StateEnum::kNotPluggedIn);
-
-    return CHIP_NO_ERROR;
-}
-
 void ShutdownElectricalMeasurementRuntime(ElectricalMeasurementRuntime & runtime)
 {
     if (runtime.eemAttrAccess)
@@ -305,16 +231,15 @@ int64_t RandomVariation(int64_t base, int64_t halfRange)
     return base + (std::rand() % (2 * halfRange + 1)) - halfRange;
 }
 
-void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId endpoint,
-                            int64_t baseVoltageMv, int64_t baseCurrentMa, int64_t basePowerMw,
-                            int64_t & cumulativeEnergyMwh)
+void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId endpoint, int64_t baseVoltageMv,
+                             int64_t baseCurrentMa, int64_t basePowerMw, int64_t & cumulativeEnergyMwh)
 {
     if (runtime.epmDelegate == nullptr)
         return;
 
-    int64_t voltage = RandomVariation(baseVoltageMv, 5'000);  // ±5 V
-    int64_t current = RandomVariation(baseCurrentMa, 500);    // ±0.5 A
-    int64_t power   = RandomVariation(basePowerMw, 100'000);  // ±100 W
+    int64_t voltage = RandomVariation(baseVoltageMv, 5'000); // ±5 V
+    int64_t current = RandomVariation(baseCurrentMa, 500);   // ±0.5 A
+    int64_t power   = RandomVariation(basePowerMw, 100'000); // ±100 W
 
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetVoltage(Nullable<int64_t>(voltage));
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActiveCurrent(Nullable<int64_t>(current));
@@ -340,15 +265,11 @@ void TelemetryTimerHandler(chip::System::Layer * /*layer*/, void * /*appState*/)
                   static_cast<double>(sSensorCumulativeEnergyMwh) / 1'000'000.0,
                   static_cast<double>(sMeterCumulativeEnergyMwh) / 1'000'000.0);
 
-    UpdateEndpointTelemetry(gElectricalSensor, kElectricalSensorEndpoint,
-                            230'000, 6'500, 1'500'000, sSensorCumulativeEnergyMwh);
-    UpdateEndpointTelemetry(gElectricalMeter, kElectricalMeterEndpoint,
-                            230'000, 8'000, 1'840'000, sMeterCumulativeEnergyMwh);
+    UpdateEndpointTelemetry(gElectricalSensor, kElectricalSensorEndpoint, 230'000, 6'500, 1'500'000, sSensorCumulativeEnergyMwh);
+    UpdateEndpointTelemetry(gElectricalMeter, kElectricalMeterEndpoint, 230'000, 8'000, 1'840'000, sMeterCumulativeEnergyMwh);
 
-    // Reschedule
-    chip::DeviceLayer::SystemLayer().StartTimer(
-        chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
-        TelemetryTimerHandler, nullptr);
+    chip::DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
+                                                TelemetryTimerHandler, nullptr);
 }
 
 } // namespace
@@ -389,14 +310,10 @@ void Phase2EnergySimulatorInit()
     VerifyOrDie(InitDemEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitElectricalMeterEndpoint() == CHIP_NO_ERROR);
     VerifyOrDie(InitElectricalUtilityMeterEndpoint() == CHIP_NO_ERROR);
-    VerifyOrDie(InitElectricalEnergyTariffEndpoint() == CHIP_NO_ERROR);
-    VerifyOrDie(InitEnergyEvseEndpoint() == CHIP_NO_ERROR);
 
-    // Start telemetry timer for dynamic attribute updates
     std::srand(static_cast<unsigned>(std::time(nullptr)));
-    chip::DeviceLayer::SystemLayer().StartTimer(
-        chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
-        TelemetryTimerHandler, nullptr);
+    chip::DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
+                                                TelemetryTimerHandler, nullptr);
     ChipLogDetail(AppServer, "Phase 2 Energy Simulator: Telemetry timer started (%u sec interval)", kTelemetryIntervalSec);
 }
 
@@ -404,20 +321,10 @@ void Phase2EnergySimulatorShutdown()
 {
     ChipLogDetail(AppServer, "Phase 2 Energy Simulator: Shutdown");
 
-    // Cancel telemetry timer
     chip::DeviceLayer::SystemLayer().CancelTimer(TelemetryTimerHandler, nullptr);
 
     TEMPORARY_RETURN_IGNORED MeterIdentificationShutdown();
     TEMPORARY_RETURN_IGNORED CommodityMeteringShutdown();
-    TEMPORARY_RETURN_IGNORED CommodityTariffShutdown();
-    TEMPORARY_RETURN_IGNORED CommodityPriceShutdown();
-    if (gEvse.instance)
-    {
-        gEvse.instance->Shutdown();
-        gEvse.instance.reset();
-    }
-    gEvse.delegate.reset();
-    gEvse.targetsDelegate.reset();
     ShutdownElectricalMeasurementRuntime(gElectricalMeter);
     TEMPORARY_RETURN_IGNORED PowerTopologyShutdown(gElectricalSensor.powerTopologyInstance, gElectricalSensor.powerTopologyDelegate);
     ShutdownElectricalMeasurementRuntime(gElectricalSensor);
@@ -432,95 +339,7 @@ DeviceEnergyManagement::DeviceEnergyManagementDelegate * GetDEMDelegate()
     return gDem.demDelegate.get();
 }
 
-bool HandleEnergyEvseTestEventTrigger(uint64_t eventTrigger)
-{
-    VerifyOrReturnError(gEvse.delegate != nullptr && gEvse.instance != nullptr, false);
-
-    switch (static_cast<chip::EnergyEvseTrigger>(eventTrigger))
-    {
-    case chip::EnergyEvseTrigger::kBasicFunctionality:
-        gEvseTestEventSaveData.oldMaxHardwareChargeCurrentLimit    = gEvse.delegate->HwGetMaxHardwareChargeCurrentLimit();
-        gEvseTestEventSaveData.oldMaxHardwareDischargeCurrentLimit = gEvse.delegate->HwGetMaxHardwareDischargeCurrentLimit();
-        gEvseTestEventSaveData.oldCircuitCapacity                  = gEvse.instance->GetCircuitCapacity();
-        gEvseTestEventSaveData.oldUserMaximumChargeCurrent         = gEvse.instance->GetUserMaximumChargeCurrent();
-        gEvseTestEventSaveData.oldStateBasic                       = gEvse.delegate->HwGetState();
-
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareChargeCurrentLimit(32000);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareDischargeCurrentLimit(32000);
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetCircuitCapacity(32000);
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetUserMaximumChargeCurrent(32000);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(EnergyEvse::StateEnum::kNotPluggedIn);
-        return true;
-    case chip::EnergyEvseTrigger::kBasicFunctionalityClear:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareChargeCurrentLimit(
-            gEvseTestEventSaveData.oldMaxHardwareChargeCurrentLimit);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetMaxHardwareDischargeCurrentLimit(
-            gEvseTestEventSaveData.oldMaxHardwareDischargeCurrentLimit);
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetCircuitCapacity(gEvseTestEventSaveData.oldCircuitCapacity);
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetUserMaximumChargeCurrent(gEvseTestEventSaveData.oldUserMaximumChargeCurrent);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(gEvseTestEventSaveData.oldStateBasic);
-        return true;
-    case chip::EnergyEvseTrigger::kEVPluggedIn:
-        gEvseTestEventSaveData.oldCableAssemblyLimit = gEvse.delegate->HwGetCableAssemblyLimit();
-        gEvseTestEventSaveData.oldStatePluggedIn     = gEvse.delegate->HwGetState();
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetCableAssemblyLimit(63000);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(EnergyEvse::StateEnum::kPluggedInNoDemand);
-        return true;
-    case chip::EnergyEvseTrigger::kEVPluggedInClear:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetCableAssemblyLimit(gEvseTestEventSaveData.oldCableAssemblyLimit);
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(gEvseTestEventSaveData.oldStatePluggedIn);
-        return true;
-    case chip::EnergyEvseTrigger::kEVChargeDemand:
-        gEvseTestEventSaveData.oldStateDemand = gEvse.delegate->HwGetState();
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(EnergyEvse::StateEnum::kPluggedInDemand);
-        return true;
-    case chip::EnergyEvseTrigger::kEVChargeDemandClear:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetState(gEvseTestEventSaveData.oldStateDemand);
-        return true;
-    case chip::EnergyEvseTrigger::kEVTimeOfUseMode:
-    case chip::EnergyEvseTrigger::kEVTimeOfUseModeClear:
-        // Mode changes are handled through the Energy EVSE Mode cluster commands.
-        return true;
-    case chip::EnergyEvseTrigger::kEVSEGroundFault:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetFault(EnergyEvse::FaultStateEnum::kGroundFault);
-        return true;
-    case chip::EnergyEvseTrigger::kEVSEOverTemperatureFault:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetFault(EnergyEvse::FaultStateEnum::kOverTemperature);
-        return true;
-    case chip::EnergyEvseTrigger::kEVSEFaultClear:
-    case chip::EnergyEvseTrigger::kEVSEDiagnosticsComplete:
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetFault(EnergyEvse::FaultStateEnum::kNoError);
-        return true;
-    case chip::EnergyEvseTrigger::kEVSESetSoCLow:
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetStateOfCharge(DataModel::MakeNullable(static_cast<Percent>(20)));
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetBatteryCapacity(DataModel::MakeNullable(static_cast<int64_t>(70'000'000)));
-        return true;
-    case chip::EnergyEvseTrigger::kEVSESetSoCHigh:
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetStateOfCharge(DataModel::MakeNullable(static_cast<Percent>(95)));
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetBatteryCapacity(DataModel::MakeNullable(static_cast<int64_t>(70'000'000)));
-        return true;
-    case chip::EnergyEvseTrigger::kEVSESetSoCClear:
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetStateOfCharge(DataModel::NullNullable);
-        TEMPORARY_RETURN_IGNORED gEvse.instance->SetBatteryCapacity(DataModel::NullNullable);
-        return true;
-    case chip::EnergyEvseTrigger::kEVSESetVehicleID: {
-        CharSpan vehicleId = CharSpan::fromCharString("Test-Vehicle-ID-012345789-ABCDEF");
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetVehicleID(vehicleId);
-        return true;
-    }
-    case chip::EnergyEvseTrigger::kEVSETriggerRFID: {
-        constexpr uint8_t rfidData[] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 };
-        TEMPORARY_RETURN_IGNORED gEvse.delegate->HwSetRFID(ByteSpan(rfidData));
-        return true;
-    }
-    default:
-        return false;
-    }
-}
-
 EndpointId GetIdentifyEndpointId()
 {
     return kElectricalSensorEndpoint;
 }
-
-} // namespace

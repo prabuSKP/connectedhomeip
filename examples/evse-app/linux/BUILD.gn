@@ -112,8 +112,6 @@ executable("chip-evse-app") {
 
 executable("chip-phase2-energy-simulator-app") {
   sources = [
-    "${chip_root}/examples/energy-gateway-app/commodity-metering/src/CommodityMeteringMain.cpp",
-    "${chip_root}/examples/energy-gateway-app/meter-identification/src/MeterIdentificationInstance.cpp",
     "${chip_root}/examples/evse-app/evse-common/src/Phase2EnergySimulatorMain.cpp",
     "include/CHIPProjectAppConfig.h",
     "phase2_main.cpp",
@@ -133,8 +131,6 @@ executable("chip-phase2-energy-simulator-app") {
     "include",
     "${chip_root}/examples/evse-app/evse-common/include",
     "${chip_root}/examples/energy-gateway-app/commodity-metering/include",
-    "${chip_root}/examples/energy-gateway-app/commodity-price/include",
-    "${chip_root}/examples/energy-gateway-app/commodity-tariff/include",
     "${chip_root}/examples/energy-gateway-app/meter-identification/include",
   ]
 
