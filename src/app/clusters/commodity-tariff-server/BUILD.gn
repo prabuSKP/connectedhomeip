@@ -15,6 +15,11 @@ import("//build_overrides/build.gni")
 import("//build_overrides/chip.gni")
 
 source_set("commodity-tariff-server") {
+  public = [
+    "CommodityTariffTestEventTriggerHandler.h",
+    "commodity-tariff-server.h",
+  ]
+
   sources = [
     "CommodityTariffAttrsDataMgmt.cpp",
     "CommodityTariffAttrsDataMgmt.h",
