@@ -150,3 +150,42 @@ To run a beginner-friendly request/response smoke test flow, use:
 For step-by-step explanation of each test and how to interpret output, see:
 
 - [Phase 2 Energy Simulator Smoke Test Guide](./phase2_energy_smoke_test_guide.md)
+
+## 12. Run Automated Comprehensive Test
+
+To run the complete comprehensive validation flow, start the simulator in one
+terminal and then run:
+
+```bash
+rm -rf /tmp/chip-tool-phase2-comprehensive
+
+./scripts/tools/phase2_energy_simulator_comprehensive_test.sh \
+  --test-suite all
+```
+
+If you only run:
+
+```bash
+./scripts/tools/phase2_energy_simulator_comprehensive_test.sh \
+  --test-suite commodity-metering
+```
+
+that will run only the 5 Commodity Metering checks, not the full suite.
+
+For the full command set, suite list, and output interpretation, see:
+
+- [Phase 2 Energy Simulator Comprehensive Test Guide](./phase2_energy_comprehensive_test_guide.md)
+
+That guide now also includes copy-paste commands for running each individual
+suite, such as:
+
+- `device-discovery`
+- `basic-information`
+- `electrical-sensor`
+- `power-topology`
+- `dem`
+- `dem-mode`
+- `electrical-meter`
+- `commodity-metering`
+- `utility-meter`
+- `meter-identification`

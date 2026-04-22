@@ -18,18 +18,18 @@ config("config") {
   include_dirs = [ "include" ]
 }
 
-source_set("commodity-price") {
+source_set("electrical-grid-conditions") {
   sources = [
-    "src/CommodityPriceDelegate.cpp",
-    "src/CommodityPriceEventTriggers.cpp",
-    "src/CommodityPriceMain.cpp",
+    "src/ElectricalGridConditionsDelegate.cpp",
+    "src/ElectricalGridConditionsEventTriggers.cpp",
+    "src/ElectricalGridConditionsMain.cpp",
   ]
 
   public_configs = [ ":config" ]
 
   public_deps = [
     "${chip_root}/src/app",
-    "${chip_root}/src/app/clusters/commodity-price-server",
+    "${chip_root}/src/app/clusters/electrical-grid-conditions-server",
     "${chip_root}/src/lib/core",
     "${chip_root}/src/lib/support",
   ]

@@ -28,7 +28,6 @@ source_set("commodity-tariff") {
   public_configs = [ ":config" ]
 
   public_deps = [
-    "${chip_root}/examples/energy-gateway-app/common",
     "${chip_root}/src/app",
     "${chip_root}/src/app/clusters/commodity-tariff-server",
     "${chip_root}/src/lib/core",

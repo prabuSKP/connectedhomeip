@@ -20,7 +20,10 @@ source_set("headers") {
     "meter-identification-server.h",
   ]
 
-  public_deps = [ "${chip_root}/src/app" ]
+  public_deps = [
+    "${chip_root}/src/app",
+    "${chip_root}/src/app:test-event-trigger",
+  ]
 }
 
 group("meter-identification-server") {

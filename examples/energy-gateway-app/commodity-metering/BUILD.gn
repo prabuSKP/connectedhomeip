@@ -20,13 +20,13 @@ config("config") {
 
 source_set("commodity-metering") {
   sources = [
+    "src/CommodityMeteringEventTriggers.cpp",
     "src/CommodityMeteringMain.cpp",
   ]
 
   public_configs = [ ":config" ]
 
   public_deps = [
-    "${chip_root}/examples/energy-gateway-app/common",
     "${chip_root}/src/app",
     "${chip_root}/src/app/clusters/commodity-metering-server",
     "${chip_root}/src/lib/core",

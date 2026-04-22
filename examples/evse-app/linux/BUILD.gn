@@ -112,6 +112,7 @@ executable("chip-evse-app") {
 
 executable("chip-phase2-energy-simulator-app") {
   sources = [
+    "${chip_root}/examples/evse-app/evse-common/phase2/EnergyEvseEventTriggersStub.cpp",
     "${chip_root}/examples/evse-app/evse-common/src/Phase2EnergySimulatorMain.cpp",
     "include/CHIPProjectAppConfig.h",
     "phase2_main.cpp",

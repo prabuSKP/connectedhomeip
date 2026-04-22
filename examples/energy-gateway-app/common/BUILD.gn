@@ -26,6 +26,11 @@ source_set("common") {
   public_configs = [ ":config" ]
 
   public_deps = [
+    "${chip_root}/examples/energy-gateway-app/commodity-metering",
+    "${chip_root}/examples/energy-gateway-app/commodity-price",
+    "${chip_root}/examples/energy-gateway-app/commodity-tariff",
+    "${chip_root}/examples/energy-gateway-app/electrical-grid-conditions",
+    "${chip_root}/examples/energy-gateway-app/meter-identification",
     "${chip_root}/src/app",
     "${chip_root}/src/lib/core",
     "${chip_root}/src/lib/support",

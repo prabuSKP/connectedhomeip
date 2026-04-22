@@ -20,7 +20,10 @@ source_set("headers") {
     "commodity-metering-server.h",
   ]
 
-  public_deps = [ "${chip_root}/src/app" ]
+  public_deps = [
+    "${chip_root}/src/app",
+    "${chip_root}/src/app:test-event-trigger",
+  ]
 }
 
 group("commodity-metering-server") {
