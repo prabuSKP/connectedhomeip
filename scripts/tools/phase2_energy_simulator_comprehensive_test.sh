@@ -25,11 +25,25 @@ PASSED_TESTS=0
 FAILED_TESTS=0
 TEST_NUMBER=0
 
+# Endpoint layout published by phase2-energy-simulator.matter / .zap
+# EP 0: Root (MA-rootdevice)
+# EP 1: Electrical Sensor  (ElectricalPowerMeasurement, ElectricalEnergyMeasurement, PowerTopology)
+# EP 2: Device Energy Management (DeviceEnergyManagement, DeviceEnergyManagementMode)
+# EP 3: Electrical Meter   (ElectricalPowerMeasurement, ElectricalEnergyMeasurement, CommodityMetering)
+# EP 4: Electrical Utility Meter (MeterIdentification)
+
+EP_ROOT=0
+EP_ELECTRICAL_SENSOR=1
+EP_DEM=2
+EP_ELECTRICAL_METER=3
+EP_UTILITY_METER=4
+
 print_usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} [options]
 
-Run comprehensive tests for the Phase 2 Virtual Energy Simulator.
+Run comprehensive tests for the Phase 2 Virtual Energy Simulator covering
+every electrical device cluster exposed by the simulator.
 
 Options:
   --node-id <id>              Node ID to use (default: ${NODE_ID})
@@ -38,8 +52,13 @@ Options:
   --pairing-mode <mode>       Pairing mode: onnetwork-long | onnetwork | code | skip
   --qr-payload <payload>      QR payload/manual code for pairing mode code
   --recommission              Unpair the node before pairing
-  --test-suite <suite>        Run specific test suite (all, device-discovery, electrical-sensor, dem, 
-                              electrical-meter, utility-meter, commodity-price, commodity-tariff, evse)
+  --test-suite <suite>        Run specific test suite. One of:
+                                all (default), device-discovery,
+                                electrical-sensor, power-topology,
+                                dem, dem-mode,
+                                electrical-meter, commodity-metering,
+                                utility-meter, meter-identification,
+                                basic-information
   --verbose                   Enable verbose output
   --log-file <file>           Log file path (default: ${LOG_FILE})
   --timeout <seconds>         Timeout for each test (default: ${TIMEOUT})
@@ -65,7 +84,7 @@ verbose_log() {
 }
 
 error() {
-    echo "[ERROR] $*" >&2 | tee -a "${LOG_FILE}"
+    echo "[ERROR] $*" | tee -a "${LOG_FILE}" >&2
 }
 
 warn() {
@@ -259,147 +278,159 @@ pair_device() {
     fi
 }
 
-# Test suite functions
+# --- Test suites ---------------------------------------------------------
+
 run_device_discovery_tests() {
     log "Running device discovery tests"
-    
-    run_test "Descriptor parts list (endpoint 0)" descriptor read parts-list "${NODE_ID}" 0
-    run_test "Descriptor server list (endpoint 1)" descriptor read server-list "${NODE_ID}" 1
-    run_test "Descriptor server list (endpoint 2)" descriptor read server-list "${NODE_ID}" 2
-    run_test "Descriptor server list (endpoint 3)" descriptor read server-list "${NODE_ID}" 3
-    run_test "Descriptor server list (endpoint 4)" descriptor read server-list "${NODE_ID}" 4
-    
-    # If we have the new endpoints, test them too
-    run_test "Descriptor server list (endpoint 5)" descriptor read server-list "${NODE_ID}" 5 || true
-    run_test "Descriptor server list (endpoint 6)" descriptor read server-list "${NODE_ID}" 6 || true
-    run_test "Descriptor server list (endpoint 7)" descriptor read server-list "${NODE_ID}" 7 || true
+
+    run_test "Root descriptor parts-list" descriptor read parts-list "${NODE_ID}" "${EP_ROOT}"
+    run_test "Root descriptor device-type-list" descriptor read device-type-list "${NODE_ID}" "${EP_ROOT}"
+    run_test "Electrical sensor descriptor server-list (EP${EP_ELECTRICAL_SENSOR})" \
+        descriptor read server-list "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "DEM descriptor server-list (EP${EP_DEM})" \
+        descriptor read server-list "${NODE_ID}" "${EP_DEM}"
+    run_test "Electrical meter descriptor server-list (EP${EP_ELECTRICAL_METER})" \
+        descriptor read server-list "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Utility meter descriptor server-list (EP${EP_UTILITY_METER})" \
+        descriptor read server-list "${NODE_ID}" "${EP_UTILITY_METER}"
+}
+
+run_basic_information_tests() {
+    log "Running basic information tests (EP${EP_ROOT})"
+
+    run_test "BasicInformation vendor-name" basicinformation read vendor-name "${NODE_ID}" "${EP_ROOT}"
+    run_test "BasicInformation product-name" basicinformation read product-name "${NODE_ID}" "${EP_ROOT}"
+    run_test "BasicInformation software-version" basicinformation read software-version "${NODE_ID}" "${EP_ROOT}"
+    run_test "BasicInformation unique-id" basicinformation read unique-id "${NODE_ID}" "${EP_ROOT}"
 }
 
 run_electrical_sensor_tests() {
-    log "Running electrical sensor tests (endpoint 1)"
-    
-    run_test "Sensor power mode" electricalpowermeasurement read power-mode "${NODE_ID}" 1
-    run_test "Sensor active power" electricalpowermeasurement read active-power "${NODE_ID}" 1
-    run_test "Sensor voltage" electricalpowermeasurement read voltage "${NODE_ID}" 1
-    run_test "Sensor active current" electricalpowermeasurement read active-current "${NODE_ID}" 1
-    run_test "Sensor cumulative energy imported" electricalenergymeasurement read cumulative-energy-imported "${NODE_ID}" 1
-    run_test "Sensor power topology feature map" powertopology read feature-map "${NODE_ID}" 1
+    log "Running electrical sensor tests (EP${EP_ELECTRICAL_SENSOR})"
+
+    run_test "Sensor power-mode" \
+        electricalpowermeasurement read power-mode "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor active-power" \
+        electricalpowermeasurement read active-power "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor voltage" \
+        electricalpowermeasurement read voltage "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor active-current" \
+        electricalpowermeasurement read active-current "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor frequency" \
+        electricalpowermeasurement read frequency "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor cumulative-energy-imported" \
+        electricalenergymeasurement read cumulative-energy-imported "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor periodic-energy-imported" \
+        electricalenergymeasurement read periodic-energy-imported "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "Sensor accuracy" \
+        electricalenergymeasurement read accuracy "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+}
+
+run_power_topology_tests() {
+    log "Running power topology tests (EP${EP_ELECTRICAL_SENSOR})"
+
+    run_test "PowerTopology feature-map" powertopology read feature-map "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "PowerTopology cluster-revision" powertopology read cluster-revision "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
+    run_test "PowerTopology attribute-list" powertopology read attribute-list "${NODE_ID}" "${EP_ELECTRICAL_SENSOR}"
 }
 
 run_device_energy_management_tests() {
-    log "Running device energy management tests (endpoint 2)"
-    
-    run_test "DEM ESA state" deviceenergymanagement read esastate "${NODE_ID}" 2
-    run_test "DEM supported modes" deviceenergymanagementmode read supported-modes "${NODE_ID}" 2
-    run_test "DEM current mode" deviceenergymanagementmode read current-mode "${NODE_ID}" 2
+    log "Running device energy management tests (EP${EP_DEM})"
+
+    run_test "DEM esa-type" deviceenergymanagement read esatype "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM esa-state" deviceenergymanagement read esastate "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM abs-min-power" deviceenergymanagement read abs-min-power "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM abs-max-power" deviceenergymanagement read abs-max-power "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM opt-out-state" deviceenergymanagement read opt-out-state "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM feature-map" deviceenergymanagement read feature-map "${NODE_ID}" "${EP_DEM}"
+}
+
+run_device_energy_management_mode_tests() {
+    log "Running device energy management mode tests (EP${EP_DEM})"
+
+    run_test "DEM-Mode supported-modes" deviceenergymanagementmode read supported-modes "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM-Mode current-mode" deviceenergymanagementmode read current-mode "${NODE_ID}" "${EP_DEM}"
+    run_test "DEM-Mode feature-map" deviceenergymanagementmode read feature-map "${NODE_ID}" "${EP_DEM}"
 }
 
 run_electrical_meter_tests() {
-    log "Running electrical meter tests (endpoint 3)"
-    
-    run_test "Meter active power" electricalpowermeasurement read active-power "${NODE_ID}" 3
-    run_test "Meter cumulative energy imported" electricalenergymeasurement read cumulative-energy-imported "${NODE_ID}" 3
-    run_test "Meter commodity metered quantity" commoditymetering read metered-quantity "${NODE_ID}" 3
+    log "Running electrical meter tests (EP${EP_ELECTRICAL_METER})"
+
+    run_test "Meter power-mode" \
+        electricalpowermeasurement read power-mode "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Meter active-power" \
+        electricalpowermeasurement read active-power "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Meter voltage" \
+        electricalpowermeasurement read voltage "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Meter active-current" \
+        electricalpowermeasurement read active-current "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Meter cumulative-energy-imported" \
+        electricalenergymeasurement read cumulative-energy-imported "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "Meter periodic-energy-imported" \
+        electricalenergymeasurement read periodic-energy-imported "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+}
+
+run_commodity_metering_tests() {
+    log "Running commodity metering tests (EP${EP_ELECTRICAL_METER})"
+
+    run_test "CommodityMetering metered-quantity" \
+        commoditymetering read metered-quantity "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "CommodityMetering metered-quantity-timestamp" \
+        commoditymetering read metered-quantity-timestamp "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "CommodityMetering tariff-unit" \
+        commoditymetering read tariff-unit "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "CommodityMetering maximum-metered-quantities" \
+        commoditymetering read maximum-metered-quantities "${NODE_ID}" "${EP_ELECTRICAL_METER}"
+    run_test "CommodityMetering feature-map" \
+        commoditymetering read feature-map "${NODE_ID}" "${EP_ELECTRICAL_METER}"
 }
 
 run_electrical_utility_meter_tests() {
-    log "Running electrical utility meter tests (endpoint 4)"
-    
-    run_test "Meter serial number" meteridentification read meter-serial-number "${NODE_ID}" 4
-    run_test "Meter type" meteridentification read meter-type "${NODE_ID}" 4 || true
-    run_test "Meter point of delivery" meteridentification read point-of-delivery "${NODE_ID}" 4 || true
+    log "Running electrical utility meter tests (EP${EP_UTILITY_METER})"
+
+    run_test "UtilityMeter descriptor device-type-list" \
+        descriptor read device-type-list "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "UtilityMeter descriptor server-list" \
+        descriptor read server-list "${NODE_ID}" "${EP_UTILITY_METER}"
 }
 
-run_commodity_price_tests() {
-    log "Running commodity price tests (endpoint 5)"
-    
-    run_test "Commodity price tariff unit" commodityprice read tariff-unit "${NODE_ID}" 5
-    run_test "Commodity price currency" commodityprice read currency "${NODE_ID}" 5
-    run_test "Commodity current price" commodityprice read current-price "${NODE_ID}" 5
-    run_test "Commodity price forecast" commodityprice read price-forecast "${NODE_ID}" 5
+run_meter_identification_tests() {
+    log "Running meter identification tests (EP${EP_UTILITY_METER})"
+
+    run_test "MeterIdentification meter-type" \
+        meteridentification read meter-type "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "MeterIdentification point-of-delivery" \
+        meteridentification read point-of-delivery "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "MeterIdentification meter-serial-number" \
+        meteridentification read meter-serial-number "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "MeterIdentification protocol-version" \
+        meteridentification read protocol-version "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "MeterIdentification power-threshold" \
+        meteridentification read power-threshold "${NODE_ID}" "${EP_UTILITY_METER}"
+    run_test "MeterIdentification feature-map" \
+        meteridentification read feature-map "${NODE_ID}" "${EP_UTILITY_METER}"
 }
 
-run_commodity_tariff_tests() {
-    log "Running commodity tariff tests (endpoint 6)"
-    
-    run_test "Commodity tariff info" commoditytariff read tariff-info "${NODE_ID}" 6
-    run_test "Commodity tariff unit" commoditytariff read tariff-unit "${NODE_ID}" 6
-    run_test "Commodity start date" commoditytariff read start-date "${NODE_ID}" 6
-    run_test "Commodity current day" commoditytariff read current-day "${NODE_ID}" 6
-    run_test "Commodity current day entry" commoditytariff read current-day-entry "${NODE_ID}" 6
-}
+# --- Main ----------------------------------------------------------------
 
-run_evse_tests() {
-    log "Running EVSE tests (endpoint 7)"
-    
-    run_test "EVSE state" energyevse read state "${NODE_ID}" 7
-    run_test "EVSE supply state" energyevse read supply-state "${NODE_ID}" 7
-    run_test "EVSE fault state" energyevse read fault-state "${NODE_ID}" 7
-    run_test "EVSE charging time" energyevse read charging-time "${NODE_ID}" 7
-    run_test "EVSE session energy charged" energyevse read session-energy-charged "${NODE_ID}" 7
-}
-
-# Main execution
 main() {
-    # Parse command line arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --node-id)
-                NODE_ID="$2"
-                shift 2
-                ;;
-            --passcode)
-                PASSCODE="$2"
-                shift 2
-                ;;
-            --discriminator)
-                DISCRIMINATOR="$2"
-                shift 2
-                ;;
-            --pairing-mode)
-                PAIRING_MODE="$2"
-                shift 2
-                ;;
-            --qr-payload)
-                QR_PAYLOAD="$2"
-                shift 2
-                ;;
-            --recommission)
-                RECOMMISSION=1
-                shift
-                ;;
-            --test-suite)
-                TEST_SUITE="$2"
-                shift 2
-                ;;
-            --verbose)
-                VERBOSE=1
-                shift
-                ;;
-            --log-file)
-                LOG_FILE="$2"
-                shift 2
-                ;;
-            --timeout)
-                TIMEOUT="$2"
-                shift 2
-                ;;
-            --storage-directory)
-                STORAGE_DIR="$2"
-                shift 2
-                ;;
-            -h|--help)
-                print_usage
-                exit 0
-                ;;
-            *)
-                error "Unknown argument: $1"
-                exit 1
-                ;;
+            --node-id)            NODE_ID="$2"; shift 2 ;;
+            --passcode)           PASSCODE="$2"; shift 2 ;;
+            --discriminator)      DISCRIMINATOR="$2"; shift 2 ;;
+            --pairing-mode)       PAIRING_MODE="$2"; shift 2 ;;
+            --qr-payload)         QR_PAYLOAD="$2"; shift 2 ;;
+            --recommission)       RECOMMISSION=1; shift ;;
+            --test-suite)         TEST_SUITE="$2"; shift 2 ;;
+            --verbose)            VERBOSE=1; shift ;;
+            --log-file)           LOG_FILE="$2"; shift 2 ;;
+            --timeout)            TIMEOUT="$2"; shift 2 ;;
+            --storage-directory)  STORAGE_DIR="$2"; shift 2 ;;
+            -h|--help)            print_usage; exit 0 ;;
+            *)                    error "Unknown argument: $1"; exit 1 ;;
         esac
     done
 
-    # Validate tools and parameters
     [[ -x "${CHIP_TOOL}" ]] || {
         error "chip-tool not found or not executable: ${CHIP_TOOL}"
         exit 1
@@ -410,53 +441,34 @@ main() {
     }
     prepare_storage_dir
     print_run_header
-
-    # Pair device if needed
     pair_device
 
-    # Run selected test suites
     case "${TEST_SUITE}" in
         all)
             run_device_discovery_tests
+            run_basic_information_tests
             run_electrical_sensor_tests
+            run_power_topology_tests
             run_device_energy_management_tests
+            run_device_energy_management_mode_tests
             run_electrical_meter_tests
+            run_commodity_metering_tests
             run_electrical_utility_meter_tests
-            run_commodity_price_tests
-            run_commodity_tariff_tests
-            run_evse_tests
+            run_meter_identification_tests
             ;;
-        device-discovery)
-            run_device_discovery_tests
-            ;;
-        electrical-sensor)
-            run_electrical_sensor_tests
-            ;;
-        dem)
-            run_device_energy_management_tests
-            ;;
-        electrical-meter)
-            run_electrical_meter_tests
-            ;;
-        utility-meter)
-            run_electrical_utility_meter_tests
-            ;;
-        commodity-price)
-            run_commodity_price_tests
-            ;;
-        commodity-tariff)
-            run_commodity_tariff_tests
-            ;;
-        evse)
-            run_evse_tests
-            ;;
-        *)
-            error "Unknown test suite: ${TEST_SUITE}"
-            exit 1
-            ;;
+        device-discovery)      run_device_discovery_tests ;;
+        basic-information)     run_basic_information_tests ;;
+        electrical-sensor)     run_electrical_sensor_tests ;;
+        power-topology)        run_power_topology_tests ;;
+        dem)                   run_device_energy_management_tests ;;
+        dem-mode)              run_device_energy_management_mode_tests ;;
+        electrical-meter)      run_electrical_meter_tests ;;
+        commodity-metering)    run_commodity_metering_tests ;;
+        utility-meter)         run_electrical_utility_meter_tests ;;
+        meter-identification)  run_meter_identification_tests ;;
+        *)                     error "Unknown test suite: ${TEST_SUITE}"; exit 1 ;;
     esac
 
-    # Report results
     echo | tee -a "${LOG_FILE}"
     log "Comprehensive tests complete: ${TOTAL_TESTS} total, ${PASSED_TESTS} passed, ${FAILED_TESTS} failed"
 

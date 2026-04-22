@@ -20,20 +20,9 @@ chip_data_model("phase2-energy-simulator-common") {
   is_server = true
 }
 
-source_set("phase2-energy-simulator-common-lib") {
-  sources = [
-    "${chip_root}/examples/energy-gateway-app/commodity-metering/src/CommodityMeteringMain.cpp",
-    "${chip_root}/examples/energy-gateway-app/commodity-price/src/CommodityPriceMain.cpp",
-    "${chip_root}/examples/energy-gateway-app/commodity-tariff/src/CommodityTariffMain.cpp",
-    "${chip_root}/examples/energy-gateway-app/meter-identification/src/MeterIdentificationInstance.cpp",
-  ]
-
+group("phase2-energy-simulator-common-lib") {
   public_deps = [
     "${chip_root}/examples/energy-gateway-app/commodity-metering:commodity-metering",
-    "${chip_root}/examples/energy-gateway-app/commodity-price:commodity-price",
-    "${chip_root}/examples/energy-gateway-app/commodity-tariff:commodity-tariff",
     "${chip_root}/examples/energy-gateway-app/meter-identification:meter-identification",
-    "${chip_root}/src/app/clusters/commodity-price-server",
-    "${chip_root}/src/app/clusters/commodity-tariff-server",
   ]
 }
