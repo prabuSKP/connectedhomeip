@@ -15,7 +15,10 @@
 import("//build_overrides/chip.gni")
 
 source_set("headers") {
-  public = [ "commodity-price-server.h" ]
+  public = [
+    "CommodityPriceTestEventTriggerHandler.h",
+    "commodity-price-server.h",
+  ]
 
   public_deps = [ "${chip_root}/src/app" ]
 }
