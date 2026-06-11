@@ -126,6 +126,23 @@ rm -f /tmp/chip-phase2-kvs
 
 Then re-run the app command.
 
+> **Important:** after `chip-tool pairing unpair` (including when the test scripts
+> use `--recommission`), the simulator loses its fabric and stops advertising.
+> Simply restarting the app is not enough if the KVS file still holds stale
+> state. Always clear the KVS **and** restart the app before attempting to
+> re-pair:
+>
+> ```bash
+> # kill the running simulator, then:
+> rm -f /tmp/chip-phase2-kvs
+> ./out/linux-x64-phase2-energy-simulator/chip-phase2-energy-simulator-app \
+>   --discriminator 3840 \
+>   --passcode 20202021 \
+>   --secured-device-port 5540 \
+>   --KVS /tmp/chip-phase2-kvs \
+>   --enable-key 000102030405060708090a0b0c0d0e0f &
+> ```
+
 ## 10. Optional: Build chip-tool Controller
 
 ```bash
@@ -143,7 +160,7 @@ To run a beginner-friendly request/response smoke test flow, use:
 ./scripts/tools/phase2_energy_simulator_smoke.sh \
   --recommission \
   --pair-timeout 30 \
-  --check-timeout 5 \
+  --check-timeout 10 \
   --response-lines 6
 ```
 
@@ -160,6 +177,7 @@ terminal and then run:
 rm -rf /tmp/chip-tool-phase2-comprehensive
 
 ./scripts/tools/phase2_energy_simulator_comprehensive_test.sh \
+  --recommission \
   --test-suite all
 ```
 
