@@ -60,8 +60,9 @@ constexpr chip::EndpointId kElectricalUtilityMeterEndpoint = 4;
 constexpr uint32_t kTelemetryIntervalSec = 10;
 
 // Telemetry state — accumulates over time
-int64_t sSensorCumulativeEnergyMwh = 45'000'000; // 45 kWh
-int64_t sMeterCumulativeEnergyMwh  = 52'000'000; // 52 kWh
+int64_t sSensorCumulativeEnergyMwh        = 45'000'000; // 45 kWh imported
+int64_t sMeterCumulativeEnergyImportedMwh = 52'000'000; // 52 kWh imported
+int64_t sMeterCumulativeEnergyExportedMwh = 12'000'000; // 12 kWh exported (simulated back-feed)
 
 const ElectricalEnergyMeasurement::Structs::MeasurementAccuracyRangeStruct::Type kMeasurementAccuracyRanges[] = {
     { .rangeMin   = 0,
@@ -150,9 +151,14 @@ void SeedElectricalPowerValues(ElectricalMeasurementRuntime & runtime, int64_t v
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActiveCurrent(Nullable<int64_t>(currentMa));
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActivePower(Nullable<int64_t>(powerMw));
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetFrequency(Nullable<int64_t>(50'000));
+    // RMSVoltage (0x000B) and RMSCurrent (0x000C) are the ALTC feature attributes used by
+    // the SmartThings driver for voltageMeasurement and currentMeasurement capabilities.
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetRMSVoltage(Nullable<int64_t>(voltageMv));
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetRMSCurrent(Nullable<int64_t>(currentMa));
 }
 
-void SeedElectricalEnergyValues(EndpointId endpointId, int64_t cumulativeImportedMwh, int64_t periodicImportedMwh)
+void SeedElectricalEnergyValues(EndpointId endpointId, int64_t cumulativeImportedMwh, int64_t periodicImportedMwh,
+                                int64_t cumulativeExportedMwh = 0, int64_t periodicExportedMwh = 0)
 {
     ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type cumulativeImported = {
         .energy = cumulativeImportedMwh,
@@ -160,15 +166,37 @@ void SeedElectricalEnergyValues(EndpointId endpointId, int64_t cumulativeImporte
     ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type periodicImported = {
         .energy = periodicImportedMwh,
     };
-    const Optional<ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type> noExportedEnergy;
 
-    NotifyCumulativeEnergyMeasured(endpointId, MakeOptional(cumulativeImported), noExportedEnergy);
-    MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
-                                           ElectricalEnergyMeasurement::Attributes::CumulativeEnergyImported::Id);
+    if (cumulativeExportedMwh > 0)
+    {
+        ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type cumulativeExported = {
+            .energy = cumulativeExportedMwh,
+        };
+        ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type periodicExported = {
+            .energy = periodicExportedMwh,
+        };
+        NotifyCumulativeEnergyMeasured(endpointId, MakeOptional(cumulativeImported), MakeOptional(cumulativeExported));
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::CumulativeEnergyImported::Id);
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::CumulativeEnergyExported::Id);
 
-    NotifyPeriodicEnergyMeasured(endpointId, MakeOptional(periodicImported), noExportedEnergy);
-    MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
-                                           ElectricalEnergyMeasurement::Attributes::PeriodicEnergyImported::Id);
+        NotifyPeriodicEnergyMeasured(endpointId, MakeOptional(periodicImported), MakeOptional(periodicExported));
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::PeriodicEnergyImported::Id);
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::PeriodicEnergyExported::Id);
+    }
+    else
+    {
+        const Optional<ElectricalEnergyMeasurement::Structs::EnergyMeasurementStruct::Type> noExportedEnergy;
+        NotifyCumulativeEnergyMeasured(endpointId, MakeOptional(cumulativeImported), noExportedEnergy);
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::CumulativeEnergyImported::Id);
+        NotifyPeriodicEnergyMeasured(endpointId, MakeOptional(periodicImported), noExportedEnergy);
+        MatterReportingAttributeChangeCallback(endpointId, ElectricalEnergyMeasurement::Id,
+                                               ElectricalEnergyMeasurement::Attributes::PeriodicEnergyImported::Id);
+    }
 }
 
 CHIP_ERROR InitElectricalSensorEndpoint()
@@ -205,7 +233,11 @@ CHIP_ERROR InitElectricalMeterEndpoint()
     ReturnErrorOnFailure(CommodityMeteringInit(kElectricalMeterEndpoint));
 
     SeedElectricalPowerValues(gElectricalMeter, 230'000, 8'000, 1'840'000);
-    SeedElectricalEnergyValues(kElectricalMeterEndpoint, 52'000'000, 250'000);
+    // Seed both imported and exported energy: the electrical-meter profile exposes
+    // separate importedEnergy and exportedEnergy components per the reviewer's Confluence doc.
+    SeedElectricalEnergyValues(kElectricalMeterEndpoint,
+                               sMeterCumulativeEnergyImportedMwh, 250'000,
+                               sMeterCumulativeEnergyExportedMwh, 60'000);
     return CHIP_NO_ERROR;
 }
 
@@ -232,7 +264,8 @@ int64_t RandomVariation(int64_t base, int64_t halfRange)
 }
 
 void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId endpoint, int64_t baseVoltageMv,
-                             int64_t baseCurrentMa, int64_t basePowerMw, int64_t & cumulativeEnergyMwh)
+                             int64_t baseCurrentMa, int64_t basePowerMw, int64_t & cumulativeEnergyMwh,
+                             int64_t * cumulativeExportedMwh = nullptr)
 {
     if (runtime.epmDelegate == nullptr)
         return;
@@ -244,6 +277,11 @@ void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId 
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetVoltage(Nullable<int64_t>(voltage));
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActiveCurrent(Nullable<int64_t>(current));
     TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetActivePower(Nullable<int64_t>(power));
+    // SetRMSVoltage/SetRMSCurrent internally call MatterReportingAttributeChangeCallback for
+    // attributes 0x000B/0x000C. These are what the ST driver subscribes to for
+    // voltageMeasurement (RMSVoltage) and currentMeasurement (RMSCurrent) capabilities.
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetRMSVoltage(Nullable<int64_t>(voltage));
+    TEMPORARY_RETURN_IGNORED runtime.epmDelegate->SetRMSCurrent(Nullable<int64_t>(current));
 
     MatterReportingAttributeChangeCallback(endpoint, ElectricalPowerMeasurement::Id,
                                            ElectricalPowerMeasurement::Attributes::Voltage::Id);
@@ -256,17 +294,34 @@ void UpdateEndpointTelemetry(ElectricalMeasurementRuntime & runtime, EndpointId 
     int64_t energyIncrementMwh = (power * static_cast<int64_t>(kTelemetryIntervalSec)) / 3600;
     cumulativeEnergyMwh += energyIncrementMwh;
 
-    SeedElectricalEnergyValues(endpoint, cumulativeEnergyMwh, energyIncrementMwh);
+    if (cumulativeExportedMwh != nullptr)
+    {
+        // Simulate export at ~25% of the import increment (e.g. net metering back-feed)
+        int64_t exportIncrementMwh = energyIncrementMwh / 4;
+        *cumulativeExportedMwh += exportIncrementMwh;
+        SeedElectricalEnergyValues(endpoint, cumulativeEnergyMwh, energyIncrementMwh,
+                                   *cumulativeExportedMwh, exportIncrementMwh);
+    }
+    else
+    {
+        SeedElectricalEnergyValues(endpoint, cumulativeEnergyMwh, energyIncrementMwh);
+    }
 }
 
 void TelemetryTimerHandler(chip::System::Layer * /*layer*/, void * /*appState*/)
 {
-    ChipLogDetail(AppServer, "Phase 2 Telemetry: tick (sensor cumE=%.1f kWh, meter cumE=%.1f kWh)",
+    ChipLogDetail(AppServer,
+                  "Phase 2 Telemetry: tick — EP1 sensor cumE=%.1f kWh | EP3 meter import=%.1f kWh export=%.1f kWh",
                   static_cast<double>(sSensorCumulativeEnergyMwh) / 1'000'000.0,
-                  static_cast<double>(sMeterCumulativeEnergyMwh) / 1'000'000.0);
+                  static_cast<double>(sMeterCumulativeEnergyImportedMwh) / 1'000'000.0,
+                  static_cast<double>(sMeterCumulativeEnergyExportedMwh) / 1'000'000.0);
 
-    UpdateEndpointTelemetry(gElectricalSensor, kElectricalSensorEndpoint, 230'000, 6'500, 1'500'000, sSensorCumulativeEnergyMwh);
-    UpdateEndpointTelemetry(gElectricalMeter, kElectricalMeterEndpoint, 230'000, 8'000, 1'840'000, sMeterCumulativeEnergyMwh);
+    UpdateEndpointTelemetry(gElectricalSensor, kElectricalSensorEndpoint, 230'000, 6'500, 1'500'000,
+                            sSensorCumulativeEnergyMwh);
+    // Pass pointer to export accumulator so EP3 (Electrical Meter) also updates
+    // CumulativeEnergyExported — required for the exportedEnergy profile component.
+    UpdateEndpointTelemetry(gElectricalMeter, kElectricalMeterEndpoint, 230'000, 8'000, 1'840'000,
+                            sMeterCumulativeEnergyImportedMwh, &sMeterCumulativeEnergyExportedMwh);
 
     chip::DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(kTelemetryIntervalSec * 1000),
                                                 TelemetryTimerHandler, nullptr);
@@ -280,10 +335,28 @@ void emberAfElectricalEnergyMeasurementClusterInitCallback(chip::EndpointId endp
     VerifyOrDie(slot != nullptr);
     VerifyOrDie(*slot == nullptr);
 
+    // Electrical Meter (EP3) must advertise IMPE + EXPE + CUME per the Confluence doc:
+    //   CumulativeEnergyImported  requires IMPE + CUME
+    //   CumulativeEnergyExported  requires EXPE + CUME  ← spec-gated; needs EXPE feature bit
+    //   CumulativeEnergyReset     requires CUME
+    // Electrical Sensor (EP1) is import-only: IMPE + CUME + PERE.
+    BitMask<ElectricalEnergyMeasurement::Feature, uint32_t> eemFeatures;
+    if (endpointId == kElectricalMeterEndpoint)
+    {
+        eemFeatures.Set(ElectricalEnergyMeasurement::Feature::kImportedEnergy)
+                   .Set(ElectricalEnergyMeasurement::Feature::kExportedEnergy)
+                   .Set(ElectricalEnergyMeasurement::Feature::kCumulativeEnergy)
+                   .Set(ElectricalEnergyMeasurement::Feature::kPeriodicEnergy);
+    }
+    else
+    {
+        eemFeatures.Set(ElectricalEnergyMeasurement::Feature::kImportedEnergy)
+                   .Set(ElectricalEnergyMeasurement::Feature::kCumulativeEnergy)
+                   .Set(ElectricalEnergyMeasurement::Feature::kPeriodicEnergy);
+    }
+
     auto attrAccess = std::make_unique<ElectricalEnergyMeasurementAttrAccess>(
-        BitMask<ElectricalEnergyMeasurement::Feature, uint32_t>(ElectricalEnergyMeasurement::Feature::kImportedEnergy,
-                                                                ElectricalEnergyMeasurement::Feature::kCumulativeEnergy,
-                                                                ElectricalEnergyMeasurement::Feature::kPeriodicEnergy),
+        eemFeatures,
         BitMask<ElectricalEnergyMeasurement::OptionalAttributes, uint32_t>(
             ElectricalEnergyMeasurement::OptionalAttributes::kOptionalAttributeCumulativeEnergyReset),
         endpointId);
