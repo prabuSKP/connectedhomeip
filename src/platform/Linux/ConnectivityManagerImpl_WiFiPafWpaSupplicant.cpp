@@ -386,8 +386,9 @@ void ConnectivityManagerImpl::OnNanReceive(GVariant * obj)
     buf = System::PacketBufferHandle::NewWithData(rxbuf, bufferLen);
 
     // Post an event to the Chip queue to deliver the data into the Chip stack.
-    ChipDeviceEvent event{ .Type                 = DeviceEventType::kCHIPoWiFiPAFReceived,
-                           .CHIPoWiFiPAFReceived = { .Data = std::move(buf).UnsafeRelease() } };
+    ChipDeviceEvent event{};
+    event.Type                        = DeviceEventType::kCHIPoWiFiPAFReceived;
+    event.CHIPoWiFiPAFReceived.Data   = std::move(buf).UnsafeRelease();
     memcpy(&event.CHIPoWiFiPAFReceived.SessionInfo, &RxInfo, sizeof(WiFiPAF::WiFiPAFSession));
     PlatformMgr().PostEventOrDie(&event);
 }

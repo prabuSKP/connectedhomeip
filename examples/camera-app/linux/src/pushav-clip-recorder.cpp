@@ -106,8 +106,8 @@ PushAVClipRecorder::~PushAVClipRecorder()
     if (IsFileReadyForUpload(mpdPath))
     {
         UpdateMPDParams(mpdPath);
-        ChipLogProgress(Camera, "Uploading final MPD: %s for track: %s, sessionID: %lu, connectionID: %u", mpdPath.c_str(),
-                        mClipInfo.mTrackName.c_str(), mClipInfo.mSessionNumber, mConnectionID);
+        ChipLogProgress(Camera, "Uploading final MPD: %s for track: %s, sessionID: %llu, connectionID: %u", mpdPath.c_str(),
+                        mClipInfo.mTrackName.c_str(), static_cast<unsigned long long>(mClipInfo.mSessionNumber), mConnectionID);
         CheckAndUploadFile(mpdPath.string());
     }
 }
@@ -266,7 +266,7 @@ AVPacket * PushAVClipRecorder::CreatePacket(const uint8_t * data, int size, int6
                 mClipInfo.mClipStartPTS = timestampMs;
             packet->flags = AV_PKT_FLAG_KEY;
 
-            ChipLogProgress(Camera, "Found I-frame at timestamp: %ld ms", timestampMs);
+            ChipLogProgress(Camera, "Found I-frame at timestamp: %lld ms", static_cast<long long>(timestampMs));
         }
 
         if (mClipInfo.mHasVideo && mClipInfo.mClipStartPTS == 0)

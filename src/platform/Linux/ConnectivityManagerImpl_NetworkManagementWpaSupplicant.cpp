@@ -257,7 +257,9 @@ void ConnectivityManagerImpl::_SetWiFiAPIdleTimeout(System::Clock::Timeout val)
 
 void ConnectivityManagerImpl::NotifyWiFiConnectivityChange(ConnectivityChange change)
 {
-    ChipDeviceEvent event{ .Type = DeviceEventType::kWiFiConnectivityChange, .WiFiConnectivityChange = { .Result = change } };
+    ChipDeviceEvent event{};
+    event.Type                        = DeviceEventType::kWiFiConnectivityChange;
+    event.WiFiConnectivityChange.Result = change;
     PlatformMgr().PostEventOrDie(&event);
 }
 
@@ -1052,8 +1054,9 @@ void ConnectivityManagerImpl::PostNetworkConnect()
                 ChipLogError(DeviceLayer, "Failed to got IP address on interface: %s", ifName);
                 continue;
             }
-            ChipDeviceEvent event{ .Type                       = DeviceEventType::kInternetConnectivityChange,
-                                   .InternetConnectivityChange = { .ipAddress = addr } };
+            ChipDeviceEvent event{};
+            event.Type                                    = DeviceEventType::kInternetConnectivityChange;
+            event.InternetConnectivityChange.ipAddress    = addr;
 
             if (addr.IsIPv4())
             {

@@ -150,9 +150,10 @@ void ThreadStackManagerImpl::ThreadDeviceRoleChangedHandler(const gchar * role)
 
     if (attached != mAttached)
     {
-        ChipDeviceEvent event{ .Type                     = DeviceEventType::kThreadConnectivityChange,
-                               .ThreadConnectivityChange = { .Result = attached ? ConnectivityChange::kConnectivity_Established
-                                                                                : ConnectivityChange::kConnectivity_Lost } };
+        ChipDeviceEvent event{};
+        event.Type                            = DeviceEventType::kThreadConnectivityChange;
+        event.ThreadConnectivityChange.Result = attached ? ConnectivityChange::kConnectivity_Established
+                                                         : ConnectivityChange::kConnectivity_Lost;
         CHIP_ERROR status = PlatformMgr().PostEvent(&event);
         if (status != CHIP_NO_ERROR)
         {
@@ -161,7 +162,9 @@ void ThreadStackManagerImpl::ThreadDeviceRoleChangedHandler(const gchar * role)
     }
     mAttached = attached;
 
-    ChipDeviceEvent event{ .Type = DeviceEventType::kThreadStateChange, .ThreadStateChange = { .RoleChanged = true } };
+    ChipDeviceEvent event{};
+    event.Type                        = DeviceEventType::kThreadStateChange;
+    event.ThreadStateChange.RoleChanged = true;
     CHIP_ERROR status = PlatformMgr().PostEvent(&event);
     if (status != CHIP_NO_ERROR)
     {
@@ -254,8 +257,9 @@ CHIP_ERROR ThreadStackManagerImpl::_SetThreadProvision(ByteSpan netInfo)
     VerifyOrReturnError(err == CHIP_NO_ERROR, err, ChipLogError(DeviceLayer, "openthread: failed to set active dataset"));
 
     // post an event alerting other subsystems about change in provisioning state
-    ChipDeviceEvent event{ .Type                      = DeviceEventType::kServiceProvisioningChange,
-                           .ServiceProvisioningChange = { .IsServiceProvisioned = true } };
+    ChipDeviceEvent event{};
+    event.Type                                    = DeviceEventType::kServiceProvisioningChange;
+    event.ServiceProvisioningChange.IsServiceProvisioned = true;
     return PlatformMgr().PostEvent(&event);
 }
 

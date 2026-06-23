@@ -261,8 +261,8 @@ CHIP_ERROR PushAVTransport::ConfigureRecorderSettings(const TransportOptionsStru
 
     PrintTransportSettings(mClipInfo, mAudioInfo, mVideoInfo);
     UpdateSendFlags();
-    ChipLogProgress(Camera, "Transport[%u] Session[%lu] ConfigureRecorderSettings success - Track=%s HasVideo=%s HasAudio=%s",
-                    mConnectionID, mSessionNumber, mClipInfo.mTrackName.c_str(), mClipInfo.mHasVideo ? "true" : "false",
+    ChipLogProgress(Camera, "Transport[%u] Session[%llu] ConfigureRecorderSettings success - Track=%s HasVideo=%s HasAudio=%s",
+                    mConnectionID, static_cast<unsigned long long>(mSessionNumber), mClipInfo.mTrackName.c_str(), mClipInfo.mHasVideo ? "true" : "false",
                     mClipInfo.mHasAudio ? "true" : "false");
 
     return CHIP_NO_ERROR;
@@ -279,8 +279,8 @@ void PushAVTransport::InitializeRecorder()
         mRecorder->SetPushAvStreamTransportServer(mPushAvStreamTransportServer);
         mRecorder->SetConnectionInfo(mConnectionID, mTransportTriggerType,
                                      chip::Optional<chip::app::Clusters::PushAvStreamTransport::TriggerActivationReasonEnum>());
-        ChipLogProgress(Camera, "PushAVTransport, Initialize Recorder done !!! FabricIdx: %u Session Id: %ld", mFabricIndex,
-                        mClipInfo.mSessionNumber);
+        ChipLogProgress(Camera, "PushAVTransport, Initialize Recorder done !!! FabricIdx: %u Session Id: %llu", mFabricIndex,
+                        static_cast<unsigned long long>(mClipInfo.mSessionNumber));
     }
     else
     {
@@ -782,8 +782,8 @@ void PushAVTransport::CheckAndUpdateSession()
     {
         mSessionStartedTimestamp = now;
         mSessionNumber++;
-        ChipLogProgress(Camera, "Transport[%u] Session[%lu] SESSION_STARTED: First session initialized for Track=%s", mConnectionID,
-                        mSessionNumber, mClipInfo.mTrackName.c_str());
+        ChipLogProgress(Camera, "Transport[%u] Session[%llu] SESSION_STARTED: First session initialized for Track=%s", mConnectionID,
+                        static_cast<unsigned long long>(mSessionNumber), mClipInfo.mTrackName.c_str());
         return;
     }
 
@@ -793,9 +793,10 @@ void PushAVTransport::CheckAndUpdateSession()
         mSessionStartedTimestamp = now;
 
         ChipLogProgress(Camera,
-                        "Transport[%u] Session[%lu] SESSION_INCREMENTED: Session duration limit reached (%d min). New session "
+                        "Transport[%u] Session[%llu] SESSION_INCREMENTED: Session duration limit reached (%d min). New session "
                         "started. Track=%s",
-                        mConnectionID, mSessionNumber, kMaxSessionDurationMinutes, mClipInfo.mTrackName.c_str());
+                        mConnectionID, static_cast<unsigned long long>(mSessionNumber), kMaxSessionDurationMinutes,
+                        mClipInfo.mTrackName.c_str());
         mStreaming = false;
         UpdateSendFlags();
         mRecorder.reset();
