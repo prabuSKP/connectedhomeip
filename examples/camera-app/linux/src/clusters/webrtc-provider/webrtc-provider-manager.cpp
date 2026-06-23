@@ -524,6 +524,14 @@ CHIP_ERROR WebRTCProviderManager::HandleProvideOffer(const ProvideOfferRequestAr
         transport->GetPeerConnection()->CreateAnswer();
     }
 
+    // Proactively trickle our local ICE candidates (host/srflx/relay) to the controller a
+    // moment after the answer. In SmartThings' ProvideOffer flow the controller never sends us
+    // its candidates, so the reactive path (HandleProvideICECandidates) never fires and our TURN
+    // relay candidate never reaches the viewer — breaking cross-network/remote live view. The
+    // short delay lets the Answer command go out first (one CommandType per transport) and lets
+    // STUN/TURN gathering complete so the relay candidate is included.
+    StartProactiveICECandidatesTimer(args.sessionId);
+
     return CHIP_NO_ERROR;
 }
 
@@ -1394,6 +1402,31 @@ void WebRTCProviderManager::OnConnectionTimeoutCallback(chip::System::Layer * sy
     // Remove from the map before handling timeout (timer already fired)
     ctx->manager->mConnectionTimerContexts.erase(ctx->sessionId);
     ctx->manager->HandleConnectionTimeout(ctx->sessionId);
+    chip::Platform::Delete(ctx);
+}
+
+void WebRTCProviderManager::StartProactiveICECandidatesTimer(uint16_t sessionId)
+{
+    auto * ctx     = chip::Platform::New<ConnectionTimeoutContext>();
+    ctx->manager   = this;
+    ctx->sessionId = sessionId;
+
+    // ~2.5s: after the Answer command has gone out and STUN/TURN gathering has completed.
+    CHIP_ERROR err = DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(2500),
+                                                           OnProactiveICECandidatesTimerFired, ctx);
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(Camera, "Failed to start proactive ICE-candidate timer for session %u: %" CHIP_ERROR_FORMAT, sessionId,
+                     err.Format());
+        chip::Platform::Delete(ctx);
+    }
+}
+
+void WebRTCProviderManager::OnProactiveICECandidatesTimerFired(chip::System::Layer * systemLayer, void * context)
+{
+    auto * ctx = static_cast<ConnectionTimeoutContext *>(context);
+    ChipLogProgress(Camera, "Proactively sending local ICE candidates to controller for session %u", ctx->sessionId);
+    ctx->manager->ScheduleICECandidatesSend(ctx->sessionId);
     chip::Platform::Delete(ctx);
 }
 

@@ -69,6 +69,15 @@ struct LinuxDeviceOptions
     bool cameraTestAudiosrc  = false;
     bool cameraAudioPlayback = false;
     chip::Optional<std::string> cameraVideoDevice;
+    // ONVIF bridge: rtsp:// stream URL. When set, the video pipeline forwards the camera's
+    // H.264 stream straight through (rtspsrc → depay → parse → appsink), no decode/re-encode.
+    chip::Optional<std::string> cameraOnvifUrl;
+    // ONVIF bridge: PTZ. When ptzUrl is set, MPTZ commands drive the real camera via ONVIF
+    // AbsoluteMove. token = media/PTZ profile token; user/pass = ONVIF creds ("" = anonymous).
+    chip::Optional<std::string> cameraOnvifPtzUrl;
+    chip::Optional<std::string> cameraOnvifToken;
+    chip::Optional<std::string> cameraOnvifUser;
+    chip::Optional<std::string> cameraOnvifPass;
 #if CHIP_DEVICE_CONFIG_ENABLE_WIFIPAF
     bool mWiFiPAF                = false;
     const char * mWiFiPAFExtCmds = nullptr;

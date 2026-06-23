@@ -21,6 +21,16 @@ import("${build_root}/config/linux/pkg_config.gni")
 
 assert(chip_build_tools)
 
+declare_args() {
+  # Absolute path to the onvif-camera-bridge daemon dir (supplies libonvif.a + headers).
+  # Injected by matter-bridge/build.sh (github.com/prabuSKP/Matter-Bridge) so this file
+  # stays machine independent.
+  onvif_bridge_daemon_dir = ""
+}
+assert(onvif_bridge_daemon_dir != "",
+       "Set gn arg onvif_bridge_daemon_dir=\"<path>/matter-bridge/daemon\" " +
+       "(matter-bridge/build.sh does this).")
+
 config("config") {
   cflags = [ "-Wno-shadow" ]
 
@@ -51,6 +61,9 @@ config("config") {
     "${chip_root}/examples/camera-app/camera-common/include/transport",
     "${chip_root}/examples/all-clusters-app/all-clusters-common/include",
     "${chip_root}/third_party/libdatachannel/repo/include",
+
+    # ONVIF bridge: daemon's self-contained ONVIF lib headers (ptz_bridge.h, onvif.h …).
+    "$onvif_bridge_daemon_dir/include",
   ]
 }
 
@@ -76,7 +89,16 @@ executable("chip-camera-app") {
   configs += [ ":gstreamer" ]
 
   configs += [ ":ffmpeg" ]
-  libs = [ "curl" ]
+
+  # ONVIF bridge: link the daemon's prebuilt self-contained ONVIF lib (PTZ control etc.).
+  # x64 (host) uses daemon/libonvif.a; ARM (hub cross-build) uses daemon/arm/libonvif.a
+  # (build it with `make -C matter-bridge/daemon CC=matter-bridge/cross/armcc libonvif.a`).
+  libs = [ "curl", "onvif" ]
+  if (target_cpu == "arm") {
+    lib_dirs = [ "$onvif_bridge_daemon_dir/arm" ]
+  } else {
+    lib_dirs = [ "$onvif_bridge_daemon_dir" ]
+  }
 
   sources = [
     "${chip_root}/examples/camera-app/linux/include/media-controller/default-media-controller.h",

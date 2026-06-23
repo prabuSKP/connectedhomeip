@@ -1,0 +1,32 @@
+# CHIP GN toolchain for cross-compiling the camera-app node to the SmartThings hub
+# (ARMv7, NXP i.MX cortex-a7, hardfp, kirkstone). Committed on the matter-camera-node
+# branch; consumed by github.com/prabuSKP/Matter-Bridge.
+#
+# Paths are injected as GN args by matter-bridge/build.sh so this file stays machine
+# independent. cc/cxx are the matter-bridge wrappers (they bake in arch flags + --sysroot
+# so host-side build tools stay clean; the global `sysroot` GN arg is NOT default-toolchain
+# scoped, so we must not use it).
+import("//build_overrides/build.gni")
+import("${build_root}/toolchain/gcc_toolchain.gni")
+
+declare_args() {
+  # matter-bridge/cross dir (holds the armcc/armcxx compiler wrappers).
+  onvif_bridge_cross_dir = ""
+  # Kirkstone SDK root (provides the cross 'ar').
+  onvif_bridge_sdk_dir = ""
+}
+assert(onvif_bridge_cross_dir != "" && onvif_bridge_sdk_dir != "",
+       "Set onvif_bridge_cross_dir and onvif_bridge_sdk_dir GN args " +
+       "(matter-bridge/build.sh does this).")
+
+gcc_toolchain("arm_kirkstone") {
+  cc  = "$onvif_bridge_cross_dir/armcc"
+  cxx = "$onvif_bridge_cross_dir/armcxx"
+  ar  = "$onvif_bridge_sdk_dir/sysroots/x86_64-pokysdk-linux/usr/bin/arm-poky-linux-gnueabi/arm-poky-linux-gnueabi-ar"
+
+  toolchain_args = {
+    current_os  = "linux"
+    current_cpu = "arm"
+    is_clang    = false
+  }
+}

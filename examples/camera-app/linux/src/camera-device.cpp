@@ -17,6 +17,7 @@
  */
 
 #include "camera-device.h"
+#include "onvif/ptz_bridge.h" // ONVIF bridge: drive real-camera PTZ from the Matter HAL
 #include <AppMain.h>
 #include <Options.h>
 #include <chrono>
@@ -543,12 +544,107 @@ GstElement * CameraDevice::CreateSnapshotPipeline(const std::string & device, in
     return nullptr; // Here to avoid compiler warnings, should never reach this point.
 }
 
+// ONVIF bridge: rtspsrc exposes its stream pads dynamically once the RTSP session is
+// negotiated, so rtspsrc → rtph264depay is linked at "pad-added" time. Only the H.264
+// video pad is linked; audio/other pads are ignored.
+static void OnvifLinkRtspPad(GstElement * src, GstPad * newPad, gpointer user_data)
+{
+    GstElement * depay = static_cast<GstElement *>(user_data);
+    GstPad * sinkPad   = gst_element_get_static_pad(depay, "sink");
+    if (sinkPad == nullptr || gst_pad_is_linked(sinkPad))
+    {
+        if (sinkPad)
+        {
+            gst_object_unref(sinkPad);
+        }
+        return;
+    }
+
+    // Link only the H.264 video application pad.
+    GstCaps * caps           = gst_pad_get_current_caps(newPad);
+    const GstStructure * st  = caps ? gst_caps_get_structure(caps, 0) : nullptr;
+    const gchar * media      = st ? gst_structure_get_string(st, "media") : nullptr;
+    const gchar * encoding   = st ? gst_structure_get_string(st, "encoding-name") : nullptr;
+    const bool isVideoH264   = (media == nullptr || g_strcmp0(media, "video") == 0) &&
+        (encoding == nullptr || g_strcmp0(encoding, "H264") == 0);
+    if (caps)
+    {
+        gst_caps_unref(caps);
+    }
+
+    if (isVideoH264)
+    {
+        if (gst_pad_link(newPad, sinkPad) != GST_PAD_LINK_OK)
+        {
+            ChipLogError(Camera, "ONVIF: failed to link rtspsrc pad → rtph264depay");
+        }
+        else
+        {
+            ChipLogProgress(Camera, "ONVIF: linked rtspsrc video pad → rtph264depay");
+        }
+    }
+    gst_object_unref(sinkPad);
+}
+
 // Helper function to create a GStreamer pipeline that captures raw video frames from
 // the camera, converts them to I420 format, encodes to H.264, and sends the encoded
 // stream to the media controller via app sink.
 GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int width, int height, int framerate,
                                                CameraError & error)
 {
+    // ONVIF bridge passthrough path: the camera already emits H.264 over RTSP, so forward
+    // its access units straight to the appsink (rtspsrc → rtph264depay → h264parse → appsink)
+    // with no decode/re-encode. width/height/framerate are dictated by the camera here.
+    if (LinuxDeviceOptions::GetInstance().cameraOnvifUrl.HasValue())
+    {
+        const std::string onvifUrl = LinuxDeviceOptions::GetInstance().cameraOnvifUrl.Value();
+        GstElement * pipeline      = gst_pipeline_new("video-pipeline");
+        GstElement * source        = gst_element_factory_make("rtspsrc", "source");
+        GstElement * depay         = gst_element_factory_make("rtph264depay", "depay");
+        GstElement * parse         = gst_element_factory_make("h264parse", "parse");
+        GstElement * h264caps      = gst_element_factory_make("capsfilter", "h264caps");
+        GstElement * appsink       = gst_element_factory_make("appsink", "appsink");
+
+        const std::vector<std::pair<GstElement *, const char *>> onvifElements = {
+            { pipeline, "pipeline" }, { source, "source" }, { depay, "depay" },
+            { parse, "parse" },       { h264caps, "h264caps" }, { appsink, "appsink" },
+        };
+        if (GstreamerPipepline::isGstElementsNull(onvifElements))
+        {
+            ChipLogError(Camera, "ONVIF: not all elements could be created.");
+            GstreamerPipepline::unrefGstElements(pipeline, source, depay, parse, h264caps, appsink);
+            error = CameraError::ERROR_INIT_FAILED;
+            return nullptr;
+        }
+
+        // rtspsrc: cap the jitterbuffer latency; let it negotiate transport (UDP→TCP fallback).
+        g_object_set(source, "location", onvifUrl.c_str(), "latency", 200, nullptr);
+        // h264parse: emit byte-stream access units and repeat SPS/PPS (config-interval=-1) so a
+        // mid-stream WebRTC viewer can start decoding immediately.
+        g_object_set(parse, "config-interval", -1, nullptr);
+        GstCaps * outCaps = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "byte-stream",
+                                                "alignment", G_TYPE_STRING, "au", nullptr);
+        g_object_set(h264caps, "caps", outCaps, nullptr);
+        gst_caps_unref(outCaps);
+        g_object_set(appsink, "emit-signals", TRUE, nullptr);
+
+        gst_bin_add_many(GST_BIN(pipeline), source, depay, parse, h264caps, appsink, nullptr);
+
+        // Static chain: rtph264depay → h264parse → capsfilter → appsink.
+        if (!gst_element_link_many(depay, parse, h264caps, appsink, nullptr))
+        {
+            ChipLogError(Camera, "ONVIF: link depay → parse → appsink failed");
+            gst_object_unref(pipeline);
+            error = CameraError::ERROR_INIT_FAILED;
+            return nullptr;
+        }
+        // rtspsrc → rtph264depay is linked dynamically (rtspsrc has sometimes-pads).
+        g_signal_connect(source, "pad-added", G_CALLBACK(OnvifLinkRtspPad), depay);
+
+        ChipLogProgress(Camera, "Video pipeline: ONVIF/RTSP source %s (H.264 passthrough)", onvifUrl.c_str());
+        return pipeline;
+    }
+
     GstElement * pipeline     = gst_pipeline_new("video-pipeline");
     GstElement * capsfilter1  = gst_element_factory_make("capsfilter", "filter1");
     GstElement * capsfilter2  = gst_element_factory_make("capsfilter", "filter2");
@@ -1624,6 +1720,33 @@ CameraError CameraDevice::SetPhysicalPTZ(chip::Optional<int16_t> aPan, chip::Opt
     if (aZoom.HasValue())
     {
         SetZoom(aZoom.Value());
+    }
+
+    // ONVIF bridge: forward the resulting absolute MPTZ position to the real camera via
+    // ONVIF AbsoluteMove. Matter ranges (pan/tilt ±90, zoom 0..75) map to ONVIF generic
+    // space (pan/tilt [-1,1], zoom [0,1]).
+    {
+        auto & opts = LinuxDeviceOptions::GetInstance();
+        if (opts.cameraOnvifPtzUrl.HasValue())
+        {
+            auto clampd  = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+            double panN  = clampd(static_cast<double>(mPan) / kMaxPanValue, -1.0, 1.0);
+            double tiltN = clampd(static_cast<double>(mTilt) / kMaxTiltValue, -1.0, 1.0);
+            double zoomN = clampd(static_cast<double>(mZoom) / kMaxZoomValue, 0.0, 1.0);
+            const std::string token = opts.cameraOnvifToken.HasValue() ? opts.cameraOnvifToken.Value() : "";
+            const std::string user  = opts.cameraOnvifUser.HasValue() ? opts.cameraOnvifUser.Value() : "";
+            const std::string pass  = opts.cameraOnvifPass.HasValue() ? opts.cameraOnvifPass.Value() : "";
+            int rc = onvif_ptz_bridge_absmove(opts.cameraOnvifPtzUrl.Value().c_str(), token.c_str(), user.c_str(),
+                                              pass.c_str(), panN, tiltN, zoomN);
+            if (rc != 0)
+            {
+                ChipLogError(Camera, "ONVIF PTZ AbsoluteMove failed (rc=%d)", rc);
+            }
+            else
+            {
+                ChipLogProgress(Camera, "ONVIF PTZ AbsoluteMove pan=%.3f tilt=%.3f zoom=%.3f", panN, tiltN, zoomN);
+            }
+        }
     }
 
     return CameraError::SUCCESS;

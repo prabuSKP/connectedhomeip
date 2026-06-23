@@ -149,6 +149,13 @@ private:
 
     static void OnConnectionTimeoutCallback(chip::System::Layer * systemLayer, void * context);
 
+    // Proactively trickle our gathered local ICE candidates to the controller a short time
+    // after the answer. The ProvideOffer flow otherwise never sends them (it waits for the
+    // controller's candidates, which SmartThings never sends), so the TURN relay candidate
+    // needed for cross-network/remote viewing never reaches the viewer.
+    void StartProactiveICECandidatesTimer(uint16_t sessionId);
+    static void OnProactiveICECandidatesTimerFired(chip::System::Layer * systemLayer, void * context);
+
     WebrtcTransport * GetTransport(uint16_t sessionId);
 
     chip::Callback::Callback<chip::OnDeviceConnected> mOnConnectedCallback;

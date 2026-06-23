@@ -155,6 +155,11 @@ enum
     kDeviceOption_Camera_TestAudiosrc,
     kDeviceOption_Camera_AudioPlayback,
     kDeviceOption_Camera_VideoDevice,
+    kDeviceOption_Camera_OnvifUrl,
+    kDeviceOption_Camera_OnvifPtzUrl,
+    kDeviceOption_Camera_OnvifToken,
+    kDeviceOption_Camera_OnvifUser,
+    kDeviceOption_Camera_OnvifPass,
 #endif
     kDeviceOption_VendorName,
     kDeviceOption_ProductName,
@@ -264,6 +269,11 @@ OptionDef sDeviceOptionDefs[] = {
     { "camera-test-audiosrc", kNoArgument, kDeviceOption_Camera_TestAudiosrc },
     { "camera-audio-playback", kNoArgument, kDeviceOption_Camera_AudioPlayback },
     { "camera-video-device", kArgumentRequired, kDeviceOption_Camera_VideoDevice },
+    { "camera-onvif-url", kArgumentRequired, kDeviceOption_Camera_OnvifUrl },
+    { "camera-onvif-ptz-url", kArgumentRequired, kDeviceOption_Camera_OnvifPtzUrl },
+    { "camera-onvif-token", kArgumentRequired, kDeviceOption_Camera_OnvifToken },
+    { "camera-onvif-user", kArgumentRequired, kDeviceOption_Camera_OnvifUser },
+    { "camera-onvif-pass", kArgumentRequired, kDeviceOption_Camera_OnvifPass },
 #endif
     {}
 };
@@ -490,6 +500,19 @@ const char * sDeviceOptionHelp =
     "\n"
     "  --camera-audio-playback\n"
     "       Enables audio playback gstreamer pipeline to play the audio received from remote peer.\n"
+    "\n"
+    "  --camera-onvif-url <rtsp-url>\n"
+    "       ONVIF bridge: stream this RTSP URL as the camera video via H.264 passthrough\n"
+    "       (no decode/re-encode). Overrides --camera-video-device and --camera-test-videosrc.\n"
+    "\n"
+    "  --camera-onvif-ptz-url <url>\n"
+    "       ONVIF bridge: PTZ service XAddr. When set, MPTZ commands drive the real camera\n"
+    "       via ONVIF AbsoluteMove.\n"
+    "  --camera-onvif-token <token>\n"
+    "       ONVIF media/PTZ profile token used for PTZ moves.\n"
+    "  --camera-onvif-user <user>\n"
+    "  --camera-onvif-pass <pass>\n"
+    "       ONVIF credentials for control calls (omit both for anonymous cameras).\n"
     "\n"
 #endif
     "\n";
@@ -997,6 +1020,26 @@ bool HandleOption(const char * aProgram, OptionSet * aOptions, int aIdentifier, 
     }
     case kDeviceOption_Camera_VideoDevice: {
         LinuxDeviceOptions::GetInstance().cameraVideoDevice.SetValue(aValue);
+        break;
+    }
+    case kDeviceOption_Camera_OnvifUrl: {
+        LinuxDeviceOptions::GetInstance().cameraOnvifUrl.SetValue(aValue);
+        break;
+    }
+    case kDeviceOption_Camera_OnvifPtzUrl: {
+        LinuxDeviceOptions::GetInstance().cameraOnvifPtzUrl.SetValue(aValue);
+        break;
+    }
+    case kDeviceOption_Camera_OnvifToken: {
+        LinuxDeviceOptions::GetInstance().cameraOnvifToken.SetValue(aValue);
+        break;
+    }
+    case kDeviceOption_Camera_OnvifUser: {
+        LinuxDeviceOptions::GetInstance().cameraOnvifUser.SetValue(aValue);
+        break;
+    }
+    case kDeviceOption_Camera_OnvifPass: {
+        LinuxDeviceOptions::GetInstance().cameraOnvifPass.SetValue(aValue);
         break;
     }
 #endif
