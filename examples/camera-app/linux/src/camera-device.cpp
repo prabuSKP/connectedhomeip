@@ -35,8 +35,11 @@
 // File used to store snapshot from stream and return for CaptureSnapshot
 // command.
 #define SNAPSHOT_FILE_PATH "./capture_snapshot.jpg"
-// Timeout for video pipeline to go to playing state.
-#define VIDEO_PIPELINE_PLAY_TIMEOUT 5
+// Timeout (seconds) to wait for the video pipeline to reach PLAYING. Kept at 0 so
+// StartVideoStream returns immediately: a live rtspsrc reaches PLAYING
+// asynchronously anyway, and the start is now triggered from the WebRTC callback
+// thread (media controller, on first viewer) which must not block.
+#define VIDEO_PIPELINE_PLAY_TIMEOUT 0
 // Framesize for audio pipeline
 #define AUDIO_FRAMESIZE 20
 
@@ -993,6 +996,18 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
+    // On-demand reference counting: multiple consumers (live WebRTC viewers and/or
+    // the push recorder) share a single pipeline. If one is already running, just
+    // record the extra consumer and reuse it; StopVideoStream tears the pipeline
+    // down only when the last consumer leaves. This avoids pulling the camera's
+    // RTSP stream 24/7 when nobody is watching.
+    if (it->videoContext != nullptr)
+    {
+        mVideoStreamConsumers[streamID]++;
+        ChipLogProgress(Camera, "Video stream %u already running; consumers=%d", streamID, mVideoStreamConsumers[streamID]);
+        return CameraError::SUCCESS;
+    }
+
     // Create Gstreamer video pipeline using the final allocated stream parameters
     CameraError error          = CameraError::SUCCESS;
     GstElement * videoPipeline = CreateVideoPipeline(mVideoDevicePath, allocatedStream.minResolution.width,
@@ -1086,7 +1101,8 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
     }
 
     // Store in stream context (keep it even if the live source is still negotiating).
-    it->videoContext = videoPipeline;
+    it->videoContext            = videoPipeline;
+    mVideoStreamConsumers[streamID] = 1; // first consumer
 
     if (state == GST_STATE_PLAYING)
     {
@@ -1102,6 +1118,18 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
 }
 
 // Stop video stream
+CameraError CameraDevice::StartVideoStreamByID(uint16_t streamID)
+{
+    auto it = std::find_if(mVideoStreams.begin(), mVideoStreams.end(),
+                           [streamID](const VideoStream & s) { return s.videoStreamParams.videoStreamID == streamID; });
+    if (it == mVideoStreams.end())
+    {
+        ChipLogError(Camera, "StartVideoStreamByID: video stream %u not found/allocated", streamID);
+        return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
+    }
+    return StartVideoStream(it->videoStreamParams);
+}
+
 CameraError CameraDevice::StopVideoStream(uint16_t streamID)
 {
     auto it = std::find_if(mVideoStreams.begin(), mVideoStreams.end(),
@@ -1111,6 +1139,17 @@ CameraError CameraDevice::StopVideoStream(uint16_t streamID)
     {
         return CameraError::ERROR_VIDEO_STREAM_STOP_FAILED;
     }
+
+    // Reference counted: keep the pipeline alive while other consumers remain;
+    // only tear it down when the last consumer leaves.
+    auto rcIt = mVideoStreamConsumers.find(streamID);
+    if (rcIt != mVideoStreamConsumers.end() && rcIt->second > 1)
+    {
+        rcIt->second--;
+        ChipLogProgress(Camera, "Video stream %u still has %d consumer(s); keeping pipeline", streamID, rcIt->second);
+        return CameraError::SUCCESS;
+    }
+    mVideoStreamConsumers.erase(streamID);
 
     GstElement * videoPipeline = reinterpret_cast<GstElement *>(it->videoContext);
     if (videoPipeline != nullptr)

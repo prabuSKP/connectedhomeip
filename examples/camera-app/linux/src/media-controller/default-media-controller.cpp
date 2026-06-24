@@ -83,12 +83,37 @@ void DefaultMediaController::RegisterTransport(Transport * transport, const std:
 
     mPreRollBuffer.RegisterTransportToBuffer(bufferSink, streamKeys);
     mSinkMap[transport] = bufferSink;
+
+    // On-demand pipeline: start the HAL video pipeline for each stream this
+    // transport consumes. Reference counted in the HAL, so additional viewers of
+    // the same stream reuse the running pipeline instead of starting a new one.
+    if (mCameraDevice)
+    {
+        for (uint16_t videoStream : videoStreams)
+        {
+            mCameraDevice->StartVideoStreamByID(videoStream);
+        }
+    }
+
     ChipLogProgress(Camera, "Transport registered successfully. Total connections: %u", (unsigned) mConnections.size());
 }
 
 void DefaultMediaController::UnregisterTransport(Transport * transport)
 {
     std::lock_guard<std::mutex> lock(mConnectionsMutex);
+
+    // Capture the video streams this transport consumed before removing it, so we
+    // can release them from the on-demand pipeline afterwards.
+    std::vector<uint16_t> videoStreamsToStop;
+    for (const auto & c : mConnections)
+    {
+        if (c.transport == transport)
+        {
+            videoStreamsToStop = c.videoStreams;
+            break;
+        }
+    }
+
     mConnections.erase(std::remove_if(mConnections.begin(), mConnections.end(),
                                       [transport](const Connection & c) { return c.transport == transport; }),
                        mConnections.end());
@@ -99,6 +124,17 @@ void DefaultMediaController::UnregisterTransport(Transport * transport)
         delete it->second;
         mSinkMap.erase(it);
         ChipLogProgress(Camera, "Sink deregistered for transport.");
+    }
+
+    // On-demand pipeline: release this transport's video streams. Reference
+    // counted in the HAL, so the pipeline is torn down only when the last
+    // consumer (viewer/recorder) of a stream is gone.
+    if (mCameraDevice)
+    {
+        for (uint16_t videoStream : videoStreamsToStop)
+        {
+            mCameraDevice->StopVideoStream(videoStream);
+        }
     }
 }
 

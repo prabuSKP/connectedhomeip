@@ -388,30 +388,26 @@ Protocols::InteractionModel::Status CameraAVStreamManager::VideoStreamAllocate(c
 
 void CameraAVStreamManager::OnVideoStreamAllocated(const VideoStreamStruct & allocatedStream, StreamAllocationAction action)
 {
+    // On-demand pipeline policy: the GStreamer/RTSP pipeline is NOT started at
+    // allocation (or at boot restore, which also routes here). It is started lazily
+    // by the media controller when the first consumer (live WebRTC viewer or push
+    // recorder) registers, and stopped when the last one leaves. This avoids
+    // pulling the camera's RTSP stream 24/7 when nobody is watching. The ONVIF
+    // passthrough forwards the camera's native H.264 and ignores the Matter-
+    // requested resolution/fps, so allocation/modification need not touch the
+    // pipeline.
     switch (action)
     {
     case StreamAllocationAction::kNewAllocation:
-        ChipLogProgress(Camera, "Starting new video stream with ID: %u", allocatedStream.videoStreamID);
-        mCameraDeviceHAL->GetCameraHALInterface().StartVideoStream(allocatedStream);
-
-        // Set the current frame rate attribute from HAL once stream has started
+        ChipLogProgress(Camera, "Video stream %u allocated (pipeline starts on first viewer).",
+                        allocatedStream.videoStreamID);
         TEMPORARY_RETURN_IGNORED GetCameraAVStreamManagementCluster()->SetCurrentFrameRate(
             mCameraDeviceHAL->GetCameraHALInterface().GetCurrentFrameRate());
         break;
 
     case StreamAllocationAction::kModification:
-        // Find the stream and restart it with new parameters
-        for (VideoStream & stream : mCameraDeviceHAL->GetCameraHALInterface().GetAvailableVideoStreams())
-        {
-            if (stream.videoStreamParams.videoStreamID == allocatedStream.videoStreamID && stream.isAllocated)
-            {
-                // For modifications, we always stop and restart the stream to ensure new parameters are applied
-                ChipLogProgress(Camera, "Restarting video stream with ID: %u due to modifications", allocatedStream.videoStreamID);
-                mCameraDeviceHAL->GetCameraHALInterface().StopVideoStream(allocatedStream.videoStreamID);
-                mCameraDeviceHAL->GetCameraHALInterface().StartVideoStream(allocatedStream);
-                break;
-            }
-        }
+        ChipLogProgress(Camera, "Video stream %u modified (passthrough ignores params; no pipeline restart).",
+                        allocatedStream.videoStreamID);
         break;
 
     case StreamAllocationAction::kReuse:

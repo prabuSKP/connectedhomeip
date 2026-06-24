@@ -116,6 +116,10 @@ public:
 
     CameraError StartVideoStream(const VideoStreamStruct & allocatedStream) override;
 
+    // Start a video stream by ID (looks up the allocated stream params). Used by the
+    // media controller to start the pipeline on-demand when the first viewer joins.
+    CameraError StartVideoStreamByID(uint16_t streamID);
+
     // Stop video stream
     CameraError StopVideoStream(uint16_t streamID) override;
 
@@ -325,6 +329,10 @@ public:
     // Timestamp handling for video and audio streams
     std::map<uint16_t, int64_t> mVideoStreamPtsOffsetMs;
     std::map<uint16_t, int64_t> mAudioStreamPtsOffsetMs;
+
+    // On-demand pipeline: number of active consumers (live viewers + recorder) per
+    // video stream ID. The GStreamer pipeline is built on 0->1 and torn down on ->0.
+    std::map<uint16_t, int> mVideoStreamConsumers;
 
 private:
     int videoDeviceFd            = -1;
