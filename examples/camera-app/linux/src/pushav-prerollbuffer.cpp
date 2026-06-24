@@ -60,25 +60,22 @@ void PreRollBuffer::PushBufferToTransport()
             continue;
         }
 
-        // Determine the cutoff time for frame delivery.
-        // This cutoff only matters for the INITIAL delivery when a sink is first registered,
-        // to decide which buffered frames to send. Once hasDeliveredFirstFrame is true,
-        // we deliver all new frames as they arrive (duplicate detection via deliveredTo handles the rest).
-        int64_t minTimeToDeliver;
-        if (!sink->hasDeliveredFirstFrame)
-        {
-            // For new sinks, deliver frames from registration time minus the pre-buffer length
-            // This ensures frames aren't filtered out if the track takes time to become ready
-            minTimeToDeliver = (sink->requestedPreBufferLengthMs == 0)
-                ? sink->registrationTimeMs - sink->minKeyframeIntervalMs
-                : sink->registrationTimeMs - sink->requestedPreBufferLengthMs;
-        }
-        else
-        {
-            // After first frame delivered, accept all frames (deliveredTo set prevents duplicates)
-            // Setting to 0 effectively disables the timestamp filter
-            minTimeToDeliver = 0;
-        }
+        // Determine the cutoff time for frame delivery. Deliver only frames at/after
+        // this sink's registration time, minus the requested pre-buffer (a push
+        // transport uses this to capture a leading keyframe; a live WebRTC viewer
+        // uses ~1ms so it effectively starts at "now").
+        //
+        // This cutoff must be applied for EVERY delivery pass, not just the first.
+        // The previous code dropped it to 0 once one frame had been delivered, which
+        // disabled the time filter and then dumped the entire pre-registration
+        // backlog still resident in the ring buffer (up to several MB / tens of
+        // seconds of old frames this sink had never received). A live viewer saw
+        // that stale video replayed fast before snapping to live. The deliveredTo
+        // set only de-duplicates frames already sent to a sink; it does NOT exclude
+        // frames that predate the sink's registration.
+        int64_t minTimeToDeliver = (sink->requestedPreBufferLengthMs == 0)
+            ? sink->registrationTimeMs - sink->minKeyframeIntervalMs
+            : sink->registrationTimeMs - sink->requestedPreBufferLengthMs;
 
         for (const std::string & streamKey : streamKeys)
         {
