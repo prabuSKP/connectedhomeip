@@ -648,6 +648,41 @@ PushAvStreamTransportManager::PersistentAttributesLoadedCallback()
             const auto transportOptionsPtr = transportConfig.GetTransportOptionsPtr();
             if (transportOptionsPtr)
             {
+                // On the runtime command path the SDK cluster server calls SetVideoStream()/
+                // SetAudioStream() before AllocatePushTransport(), which populates the
+                // mVideoStreamParams / mAudioStreamParams members. This restore path does NOT
+                // go through the SDK, so without resolving them here the PushAVTransport
+                // constructor receives zero-initialized stream params (channel/sampleRate/
+                // bitRate == 0) and crashes. Resolve them from the currently-allocated streams
+                // first, and skip restoring this transport if a referenced stream is not
+                // (yet) allocated -- the controller re-establishes it at runtime.
+                bool streamsResolved = true;
+                if (transportOptionsPtr->videoStreamID.HasValue() && !transportOptionsPtr->videoStreamID.Value().IsNull())
+                {
+                    if (SetVideoStream(transportOptionsPtr->videoStreamID.Value().Value()) !=
+                        Protocols::InteractionModel::Status::Success)
+                    {
+                        ChipLogError(Zcl, "Skipping restore of connection %u: video stream %u not allocated", connectionID,
+                                     transportOptionsPtr->videoStreamID.Value().Value());
+                        streamsResolved = false;
+                    }
+                }
+                if (streamsResolved && transportOptionsPtr->audioStreamID.HasValue() &&
+                    !transportOptionsPtr->audioStreamID.Value().IsNull())
+                {
+                    if (SetAudioStream(transportOptionsPtr->audioStreamID.Value().Value()) !=
+                        Protocols::InteractionModel::Status::Success)
+                    {
+                        ChipLogError(Zcl, "Skipping restore of connection %u: audio stream %u not allocated", connectionID,
+                                     transportOptionsPtr->audioStreamID.Value().Value());
+                        streamsResolved = false;
+                    }
+                }
+                if (!streamsResolved)
+                {
+                    continue;
+                }
+
                 Protocols::InteractionModel::Status status =
                     this->AllocatePushTransport(*transportOptionsPtr, connectionID, transportConfig.GetFabricIndex());
                 if (status != Protocols::InteractionModel::Status::Success)
