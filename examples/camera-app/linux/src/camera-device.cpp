@@ -1064,22 +1064,39 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
-    // Wait for the pipeline to reach the PLAYING state
+    // Wait for the pipeline to reach the PLAYING state. A live ONVIF/RTSP source
+    // negotiates asynchronously (rtspsrc does DESCRIBE/SETUP/PLAY, which can take
+    // several seconds), so get_state frequently returns GST_STATE_CHANGE_ASYNC
+    // here. That is NOT a failure: keep the pipeline running and let it reach
+    // PLAYING in the background -- the appsink new-sample callback starts
+    // delivering H.264 frames as soon as rtspsrc connects. Tearing the pipeline
+    // down on a timeout (the previous behavior) permanently killed video whenever
+    // the camera was slow to answer, so the WebRTC viewer got no media and the
+    // session timed out. Only a hard FAILURE is fatal.
     GstState state;
-    gst_element_get_state(videoPipeline, &state, nullptr, VIDEO_PIPELINE_PLAY_TIMEOUT * GST_SECOND);
-    if (state != GST_STATE_PLAYING)
+    GstStateChangeReturn waitResult =
+        gst_element_get_state(videoPipeline, &state, nullptr, VIDEO_PIPELINE_PLAY_TIMEOUT * GST_SECOND);
+    if (waitResult == GST_STATE_CHANGE_FAILURE)
     {
-        ChipLogError(Camera, "Video pipeline did not reach PLAYING state.");
+        ChipLogError(Camera, "Video pipeline failed to start.");
         gst_element_set_state(videoPipeline, GST_STATE_NULL);
         gst_object_unref(videoPipeline);
         it->videoContext = nullptr;
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
-    // Store in stream context
+    // Store in stream context (keep it even if the live source is still negotiating).
     it->videoContext = videoPipeline;
 
-    ChipLogProgress(Camera, "Video is PLAYING …");
+    if (state == GST_STATE_PLAYING)
+    {
+        ChipLogProgress(Camera, "Video is PLAYING …");
+    }
+    else
+    {
+        ChipLogProgress(Camera,
+                        "Video pipeline starting asynchronously (rtspsrc negotiating); frames will flow once connected.");
+    }
 
     return CameraError::SUCCESS;
 }
