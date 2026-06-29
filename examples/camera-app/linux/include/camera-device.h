@@ -76,6 +76,19 @@ namespace Camera {
 
 constexpr const char * kDefaultVideoDevicePath = "/dev/video0";
 
+// Per-camera ONVIF connection config.  Populated from cameras.json (multi-camera
+// bridge) or from CLI options (single-camera backward-compat path in main.cpp).
+struct OnvifConfig
+{
+    std::string rtspUrl;     // RTSP stream URL, e.g. rtsp://192.168.1.100/live/ch00_0
+    std::string ptzUrl;      // ONVIF PTZ service URL
+    std::string token;       // ONVIF profile token
+    std::string user;
+    std::string pass;
+    bool useTestSrc = false; // when true (rtspUrl empty), use a GStreamer test pattern
+                             // instead of RTSP/V4L2 — for hardware-free multi-camera testing
+};
+
 // Camera defined constants for Pan, Tilt, Zoom bounding values
 constexpr int16_t kMinPanValue  = -90;
 constexpr int16_t kMaxPanValue  = 90;
@@ -318,6 +331,11 @@ public:
 
     void SetVideoDevicePath(const std::string & path) { mVideoDevicePath = path; }
 
+    // Per-instance ONVIF connection config (replaces the global LinuxDeviceOptions singleton
+    // for multi-camera operation).  Call before Init().
+    void SetOnvifConfig(const OnvifConfig & config) { mOnvifConfig = config; }
+    const OnvifConfig & GetOnvifConfig() const { return mOnvifConfig; }
+
     void HandleSimulatedZoneTriggeredEvent(const std::vector<uint16_t> & zoneIds);
 
     void HandleSimulatedZoneStoppedEvent(uint16_t zoneId);
@@ -335,6 +353,8 @@ public:
     std::map<uint16_t, int> mVideoStreamConsumers;
 
 private:
+    OnvifConfig mOnvifConfig; // per-instance ONVIF config; set via SetOnvifConfig() before Init()
+
     int videoDeviceFd            = -1;
     std::string mVideoDevicePath = kDefaultVideoDevicePath;
     std::vector<VideoStream> mVideoStreams;       // Vector to hold available video streams

@@ -598,9 +598,9 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
     // ONVIF bridge passthrough path: the camera already emits H.264 over RTSP, so forward
     // its access units straight to the appsink (rtspsrc → rtph264depay → h264parse → appsink)
     // with no decode/re-encode. width/height/framerate are dictated by the camera here.
-    if (LinuxDeviceOptions::GetInstance().cameraOnvifUrl.HasValue())
+    if (!mOnvifConfig.rtspUrl.empty())
     {
-        const std::string onvifUrl = LinuxDeviceOptions::GetInstance().cameraOnvifUrl.Value();
+        const std::string onvifUrl = mOnvifConfig.rtspUrl;
         GstElement * pipeline      = gst_pipeline_new("video-pipeline");
         GstElement * source        = gst_element_factory_make("rtspsrc", "source");
         GstElement * depay         = gst_element_factory_make("rtph264depay", "depay");
@@ -656,7 +656,7 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
     GstElement * appsink      = gst_element_factory_make("appsink", "appsink");
     GstElement * source       = nullptr;
 
-    if (LinuxDeviceOptions::GetInstance().cameraTestVideosrc)
+    if (mOnvifConfig.useTestSrc || LinuxDeviceOptions::GetInstance().cameraTestVideosrc)
     {
         const int kBallAnimationPattern = 18;
         source                          = gst_element_factory_make("videotestsrc", "source");
@@ -1781,27 +1781,21 @@ CameraError CameraDevice::SetPhysicalPTZ(chip::Optional<int16_t> aPan, chip::Opt
     // ONVIF bridge: forward the resulting absolute MPTZ position to the real camera via
     // ONVIF AbsoluteMove. Matter ranges (pan/tilt ±90, zoom 0..75) map to ONVIF generic
     // space (pan/tilt [-1,1], zoom [0,1]).
+    if (!mOnvifConfig.ptzUrl.empty())
     {
-        auto & opts = LinuxDeviceOptions::GetInstance();
-        if (opts.cameraOnvifPtzUrl.HasValue())
+        auto clampd  = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+        double panN  = clampd(static_cast<double>(mPan) / kMaxPanValue, -1.0, 1.0);
+        double tiltN = clampd(static_cast<double>(mTilt) / kMaxTiltValue, -1.0, 1.0);
+        double zoomN = clampd(static_cast<double>(mZoom) / kMaxZoomValue, 0.0, 1.0);
+        int rc = onvif_ptz_bridge_absmove(mOnvifConfig.ptzUrl.c_str(), mOnvifConfig.token.c_str(),
+                                          mOnvifConfig.user.c_str(), mOnvifConfig.pass.c_str(), panN, tiltN, zoomN);
+        if (rc != 0)
         {
-            auto clampd  = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-            double panN  = clampd(static_cast<double>(mPan) / kMaxPanValue, -1.0, 1.0);
-            double tiltN = clampd(static_cast<double>(mTilt) / kMaxTiltValue, -1.0, 1.0);
-            double zoomN = clampd(static_cast<double>(mZoom) / kMaxZoomValue, 0.0, 1.0);
-            const std::string token = opts.cameraOnvifToken.HasValue() ? opts.cameraOnvifToken.Value() : "";
-            const std::string user  = opts.cameraOnvifUser.HasValue() ? opts.cameraOnvifUser.Value() : "";
-            const std::string pass  = opts.cameraOnvifPass.HasValue() ? opts.cameraOnvifPass.Value() : "";
-            int rc = onvif_ptz_bridge_absmove(opts.cameraOnvifPtzUrl.Value().c_str(), token.c_str(), user.c_str(),
-                                              pass.c_str(), panN, tiltN, zoomN);
-            if (rc != 0)
-            {
-                ChipLogError(Camera, "ONVIF PTZ AbsoluteMove failed (rc=%d)", rc);
-            }
-            else
-            {
-                ChipLogProgress(Camera, "ONVIF PTZ AbsoluteMove pan=%.3f tilt=%.3f zoom=%.3f", panN, tiltN, zoomN);
-            }
+            ChipLogError(Camera, "ONVIF PTZ AbsoluteMove failed (rc=%d)", rc);
+        }
+        else
+        {
+            ChipLogProgress(Camera, "ONVIF PTZ AbsoluteMove pan=%.3f tilt=%.3f zoom=%.3f", panN, tiltN, zoomN);
         }
     }
 

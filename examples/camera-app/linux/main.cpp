@@ -22,6 +22,7 @@
 #include "tls-client-management-instance.h"
 
 #include <AppMain.h>
+#include <Options.h>
 #include <platform/CHIPDeviceConfig.h>
 
 using namespace chip;
@@ -60,6 +61,19 @@ void ApplicationInit()
     {
         ChipLogError(NotSpecified, "Failed to start CHIP NamedPipeCommands");
         TEMPORARY_RETURN_IGNORED sChipNamedPipeCommands.Stop();
+    }
+
+    // Populate per-instance ONVIF config from CLI options so camera-device.cpp
+    // no longer needs to reach into the global LinuxDeviceOptions singleton.
+    {
+        auto & opts = LinuxDeviceOptions::GetInstance();
+        Camera::OnvifConfig cfg;
+        if (opts.cameraOnvifUrl.HasValue())    cfg.rtspUrl = opts.cameraOnvifUrl.Value();
+        if (opts.cameraOnvifPtzUrl.HasValue()) cfg.ptzUrl  = opts.cameraOnvifPtzUrl.Value();
+        if (opts.cameraOnvifToken.HasValue())  cfg.token   = opts.cameraOnvifToken.Value();
+        if (opts.cameraOnvifUser.HasValue())   cfg.user    = opts.cameraOnvifUser.Value();
+        if (opts.cameraOnvifPass.HasValue())   cfg.pass    = opts.cameraOnvifPass.Value();
+        gCameraDevice.SetOnvifConfig(cfg);
     }
 
     gCameraDevice.Init();
