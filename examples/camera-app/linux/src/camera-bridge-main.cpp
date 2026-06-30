@@ -36,6 +36,7 @@
 // is absent (single-camera bring-up / backward-compat).
 
 #include "CameraAppCommandDelegate.h"
+#include "bridge-ipc-server.h"
 #include "camera-app.h"
 #include "camera-device.h"
 #include "cameras-config.h"
@@ -44,6 +45,9 @@
 
 // Bridge-app Device base (provides BridgedDeviceBasicInformation cluster)
 #include "Device.h"
+
+// ONVIF resolve (control URL + creds -> RTSP/PTZ/token); from the daemon's libonvif.a.
+#include "onvif/resolve_bridge.h"
 
 #include <AppMain.h>
 #include <Options.h>
@@ -56,7 +60,10 @@
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/PlatformManager.h>
 
+#include <atomic>
+#include <fstream>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace chip;
@@ -143,6 +150,12 @@ public:
         }
     }
 
+    // The full source+resolved record, kept so we can persist cameras.json and
+    // look the camera up by its stable DNI for remove/replace.
+    void SetEntry(const CameraConfig::CameraEntry & e) { mEntry = e; }
+    const CameraConfig::CameraEntry & GetEntry() const { return mEntry; }
+    const std::string & GetDni() const { return mEntry.dni; }
+
     // DataVersion backing store for the ember cluster list above (Descriptor only = 1 entry).
     DataVersion mDataVersions[MATTER_ARRAY_SIZE(sBridgedCameraClusters)] = {};
 
@@ -151,10 +164,17 @@ private:
 
     CameraDevice mCameraDevice;
     std::unique_ptr<CameraApp> mCameraApp;
+    CameraConfig::CameraEntry mEntry;
 };
 
-// Owns all bridged cameras for the lifetime of the process.
+// Owns all bridged cameras for the lifetime of the process. Mutated only on the
+// single IPC accept thread at runtime (and in ApplicationInit/Shutdown, when no
+// IPC thread is running), so it needs no lock of its own; the ember/registry
+// mutations inside are serialised against the Matter event loop via StackLock.
 std::vector<std::unique_ptr<BridgedCamera>> gBridgedCameras;
+
+// Camera count published to the `ping` health response (read from the IPC thread).
+std::atomic<size_t> gCameraCount{ 0 };
 
 // ---------------------------------------------------------------------------
 // Add one bridged camera endpoint.
@@ -216,6 +236,166 @@ int AddCameraEndpoint(BridgedCamera * cam, EndpointId parentId)
 
     ChipLogError(DeviceLayer, "AddCameraEndpoint: all %d dynamic slots are full", CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT);
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Create a bridged camera from a fully-resolved config entry: make the backend,
+// give it a stable DNI-derived uniqueId, register the dynamic endpoint, and keep
+// it alive in gBridgedCameras. Returns the assigned endpoint id, or -1 on failure.
+// Used by both ApplicationInit (cameras.json) and the IPC upsert path so the two
+// behave identically.
+// ---------------------------------------------------------------------------
+int AddCamera(const CameraConfig::CameraEntry & entry)
+{
+    auto cam = std::make_unique<BridgedCamera>(entry.name.c_str(), entry.onvif);
+    cam->SetEntry(entry);
+
+    // Stable identity: derive the Bridged uniqueId from the DNI so a camera keeps
+    // its identity across restarts. The id is capped (Device::kDeviceUniqueIdSize,
+    // 32); keep the tail — the UUID part of "onvif-urn:uuid:<uuid>" — which is the
+    // actually-unique portion.
+    if (!entry.dni.empty())
+    {
+        constexpr size_t kUniqueIdCap = 32;
+        std::string uid               = entry.dni;
+        if (uid.size() > kUniqueIdCap)
+            uid = uid.substr(uid.size() - kUniqueIdCap);
+        cam->SetUniqueId(uid.c_str());
+    }
+
+    if (AddCameraEndpoint(cam.get(), gAggregatorEndpointId) < 0)
+    {
+        cam->Shutdown();
+        return -1;
+    }
+
+    int endpoint = static_cast<int>(cam->GetEndpointId());
+    gBridgedCameras.push_back(std::move(cam));
+    gCameraCount.store(gBridgedCameras.size());
+    return endpoint;
+}
+
+// Remove the bridged camera with this DNI: clear its dynamic endpoint and tear
+// down its backend. Returns true if a matching camera was found.
+//
+// Called from the IPC accept thread, which does not hold the Matter stack lock,
+// so the ember/registry mutations run under StackLock — the same foreign-thread
+// pattern bridge-app uses in RemoveDeviceEndpoint. (Do NOT route this through
+// PlatformMgr().ScheduleWork(): the POSIX event loop dispatches scheduled work
+// with the non-recursive stack mutex already held, so StackLock would deadlock.)
+bool RemoveCameraByDni(const std::string & dni)
+{
+    if (dni.empty())
+        return false;
+
+    for (auto it = gBridgedCameras.begin(); it != gBridgedCameras.end(); ++it)
+    {
+        if ((*it)->GetDni() != dni)
+            continue;
+
+        BridgedCamera * cam = it->get();
+        {
+            StackLock lock;
+            for (uint8_t i = 1; i < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++i)
+            {
+                if (gDevices[i] == cam)
+                {
+                    cam->Unregister();              // BridgedDeviceBasicInformation
+                    emberAfClearDynamicEndpoint(i); // drop the endpoint from the data model
+                    gDevices[i] = nullptr;
+                    break;
+                }
+            }
+            cam->Shutdown(); // camera clusters + WebRTC/GStreamer, while the stack is quiesced
+        }
+
+        ChipLogProgress(Camera, "CameraBridge: removed camera dni=%s", dni.c_str());
+        gBridgedCameras.erase(it);
+        gCameraCount.store(gBridgedCameras.size());
+        return true;
+    }
+    return false;
+}
+
+// Persist the current camera list to cameras.json so IPC-added cameras survive a
+// restart. Called on the IPC thread after each successful add/remove.
+void PersistCameras()
+{
+    std::vector<CameraConfig::CameraEntry> entries;
+    entries.reserve(gBridgedCameras.size());
+    for (const auto & cam : gBridgedCameras)
+        entries.push_back(cam->GetEntry());
+    CameraConfig::SaveToFile(entries);
+}
+
+// ---------------------------------------------------------------------------
+// IPC callbacks — run on the BridgeIpc accept thread (a foreign thread).
+// ---------------------------------------------------------------------------
+BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
+{
+    BridgeIpc::OpResult out;
+
+    // Resolve ONVIF off the Matter event loop (blocking SOAP network calls).
+    onvif_resolved_bridge_t res;
+    int wantMain = (req.stream != "substream") ? 1 : 0;
+    int rc       = onvif_resolve_bridge(req.controlUrl.c_str(), req.userid.c_str(), req.password.c_str(), wantMain, &res);
+    if (rc != ONVIF_BRIDGE_OK)
+    {
+        switch (rc)
+        {
+        case ONVIF_BRIDGE_AUTH:        out.status = "auth_failed"; break;
+        case ONVIF_BRIDGE_UNREACHABLE: out.status = "unreachable"; break;
+        case ONVIF_BRIDGE_NO_STREAMS:  out.status = "no_streams"; break;
+        default:                       out.status = "internal_error"; break;
+        }
+        out.error = "ONVIF resolve failed (rc=" + std::to_string(rc) + ")";
+        ChipLogError(Camera, "CameraBridge: upsert dni=%s resolve failed (%s)", req.dni.c_str(), out.status.c_str());
+        return out;
+    }
+
+    CameraConfig::CameraEntry entry;
+    entry.name          = req.name.empty() ? std::string("Camera") : req.name;
+    entry.dni           = req.dni;
+    entry.controlUrl    = req.controlUrl;
+    entry.stream        = req.stream.empty() ? std::string("mainstream") : req.stream;
+    entry.onvif.rtspUrl = res.rtsp_url;
+    entry.onvif.ptzUrl  = res.ptz_url;
+    entry.onvif.token   = res.token;
+    entry.onvif.user    = req.userid;
+    entry.onvif.pass    = req.password;
+
+    // Replace any existing camera with the same DNI (idempotent re-onboard).
+    RemoveCameraByDni(req.dni);
+
+    int endpoint = AddCamera(entry);
+    if (endpoint < 0)
+    {
+        out.status = "internal_error";
+        out.error  = "failed to create camera endpoint";
+        return out;
+    }
+
+    PersistCameras();
+
+    out.ok          = true;
+    out.status      = "onboarded";
+    out.endpoint    = endpoint;
+    out.profiles    = res.profiles;
+    out.videoCodec  = res.codec;
+    out.hasPtz      = res.has_ptz != 0;
+    out.hasAudioOut = res.has_audio_out != 0;
+    ChipLogProgress(Camera, "CameraBridge: upsert dni=%s onboarded on endpoint %d", req.dni.c_str(), endpoint);
+    return out;
+}
+
+BridgeIpc::OpResult HandleIpcRemove(const std::string & dni)
+{
+    BridgeIpc::OpResult out;
+    RemoveCameraByDni(dni); // idempotent: a not-found camera is already "removed"
+    PersistCameras();
+    out.ok     = true;
+    out.status = "removed";
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +463,13 @@ void ApplicationInit()
     // ------------------------------------------------------------------
     auto cameraList = CameraConfig::LoadFromFile();
 
-    if (cameraList.empty())
+    // Only synthesize a single-camera CLI fallback when cameras.json is ABSENT.
+    // A present-but-empty file ("[]") explicitly means "no cameras yet — the Edge
+    // driver will add them over IPC", so we must not create a phantom CLI camera
+    // (which would duplicate a camera once it is onboarded through the driver).
+    bool haveConfigFile = std::ifstream(CameraConfig::kDefaultPath).good();
+
+    if (cameraList.empty() && !haveConfigFile)
     {
         auto & opts = LinuxDeviceOptions::GetInstance();
         CameraConfig::CameraEntry entry;
@@ -297,30 +483,42 @@ void ApplicationInit()
                         entry.onvif.rtspUrl.c_str());
         cameraList.push_back(std::move(entry));
     }
+    else if (cameraList.empty())
+    {
+        ChipLogProgress(Camera, "CameraBridge: cameras.json present but empty — starting with 0 cameras (IPC-driven)");
+    }
 
     // ------------------------------------------------------------------
     // Create one bridged endpoint per camera.
     // ------------------------------------------------------------------
     for (const auto & entry : cameraList)
     {
-        auto cam = std::make_unique<BridgedCamera>(entry.name.c_str(), entry.onvif);
-
-        if (AddCameraEndpoint(cam.get(), gAggregatorEndpointId) < 0)
-        {
+        if (AddCamera(entry) < 0)
             ChipLogError(Camera, "CameraBridge: failed to add endpoint for '%s'", entry.name.c_str());
-            cam->Shutdown();
-        }
-        else
-        {
-            gBridgedCameras.push_back(std::move(cam));
-        }
     }
 
     ChipLogProgress(Camera, "CameraBridge: %zu camera(s) registered on dynamic endpoints", gBridgedCameras.size());
+
+    // ------------------------------------------------------------------
+    // Start the Edge⇄bridge IPC server (ipc/PROTOCOL.md) so the Edge driver can
+    // add/remove cameras at runtime without a restart. Binds 0.0.0.0:9444.
+    // ------------------------------------------------------------------
+    BridgeIpc::Callbacks ipcCallbacks;
+    ipcCallbacks.upsert = [](const BridgeIpc::UpsertRequest & req) { return HandleIpcUpsert(req); };
+    ipcCallbacks.remove = [](const std::string & dni) { return HandleIpcRemove(dni); };
+    ipcCallbacks.count  = []() -> size_t { return gCameraCount.load(); };
+    if (!BridgeIpc::Start(9444, std::move(ipcCallbacks)))
+    {
+        ChipLogError(Camera, "CameraBridge: IPC server failed to start on :9444 (runtime add/remove disabled)");
+    }
 }
 
 void ApplicationShutdown()
 {
+    // Stop accepting IPC requests first and join the accept thread, so no upsert/
+    // remove can mutate the camera list while we tear it down below.
+    BridgeIpc::Stop();
+
     // Close WebRTC connections while the Matter SystemLayer is still running so
     // that WebRTC callbacks (e.g. OnConnectionStateChanged) can use ScheduleLambda.
     for (auto & cam : gBridgedCameras)

@@ -183,8 +183,9 @@ executable("chip-camera-bridge-app") {
     "${chip_root}/examples/camera-app/linux/src/webrtc-libdatachannel.cpp",
     "${chip_root}/examples/camera-app/linux/src/webrtc-transport.cpp",
 
-    # Bridge-specific config and multi-camera main
+    # Bridge-specific config, IPC server, and multi-camera main
     "include/CHIPProjectBridgeConfig.h",
+    "src/bridge-ipc-server.cpp",
     "src/camera-bridge-main.cpp",
   ]
 

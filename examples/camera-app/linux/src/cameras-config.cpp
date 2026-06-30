@@ -17,6 +17,7 @@
 
 #include "cameras-config.h"
 
+#include <cstdio>
 #include <fstream>
 #include <lib/support/logging/CHIPLogging.h>
 #include <sstream>
@@ -97,6 +98,9 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
     {
         CameraEntry entry;
         entry.name         = ExtractField(obj, "name");
+        entry.dni          = ExtractField(obj, "dni");
+        entry.controlUrl   = ExtractField(obj, "control_url");
+        entry.stream       = ExtractField(obj, "stream");
         entry.onvif.rtspUrl = ExtractField(obj, "rtsp");
         entry.onvif.ptzUrl  = ExtractField(obj, "ptz");
         entry.onvif.token   = ExtractField(obj, "token");
@@ -128,6 +132,56 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
 
     ChipLogProgress(Camera, "cameras-config: %zu camera(s) loaded from %s", cameras.size(), path);
     return cameras;
+}
+
+bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
+{
+    // Write to a sibling .tmp then rename, so a crash mid-write can't truncate
+    // the live config (rename is atomic on the same filesystem).
+    std::string tmpPath = std::string(path) + ".tmp";
+
+    std::ofstream file(tmpPath, std::ios::trunc);
+    if (!file.is_open())
+    {
+        ChipLogError(Camera, "cameras-config: cannot open %s for write", tmpPath.c_str());
+        return false;
+    }
+
+    file << "[\n";
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        const auto & c   = cameras[i];
+        const char * src = c.onvif.useTestSrc ? "test" : c.onvif.rtspUrl.c_str();
+        file << "  { \"name\": \"" << c.name << "\""
+             << ", \"dni\": \"" << c.dni << "\""
+             << ", \"rtsp\": \"" << src << "\""
+             << ", \"ptz\": \"" << c.onvif.ptzUrl << "\""
+             << ", \"token\": \"" << c.onvif.token << "\""
+             << ", \"user\": \"" << c.onvif.user << "\""
+             << ", \"pass\": \"" << c.onvif.pass << "\""
+             << ", \"control_url\": \"" << c.controlUrl << "\""
+             << ", \"stream\": \"" << (c.stream.empty() ? "mainstream" : c.stream) << "\" }"
+             << (i + 1 < cameras.size() ? "," : "") << "\n";
+    }
+    file << "]\n";
+    file.close();
+
+    if (file.fail())
+    {
+        ChipLogError(Camera, "cameras-config: write to %s failed", tmpPath.c_str());
+        std::remove(tmpPath.c_str());
+        return false;
+    }
+
+    if (std::rename(tmpPath.c_str(), path) != 0)
+    {
+        ChipLogError(Camera, "cameras-config: rename %s -> %s failed", tmpPath.c_str(), path);
+        std::remove(tmpPath.c_str());
+        return false;
+    }
+
+    ChipLogProgress(Camera, "cameras-config: saved %zu camera(s) to %s", cameras.size(), path);
+    return true;
 }
 
 } // namespace CameraConfig
