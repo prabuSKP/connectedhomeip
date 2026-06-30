@@ -48,6 +48,8 @@
 
 // ONVIF resolve (control URL + creds -> RTSP/PTZ/token); from the daemon's libonvif.a.
 #include "onvif/resolve_bridge.h"
+// ONVIF WS-Discovery (find cameras on the LAN), so the bridge populates cameras.json itself.
+#include "onvif/wsdiscovery.h"
 
 #include <AppMain.h>
 #include <Options.h>
@@ -463,6 +465,52 @@ void ApplicationInit()
     // ------------------------------------------------------------------
     auto cameraList = CameraConfig::LoadFromFile();
 
+    // ------------------------------------------------------------------
+    // [single_bridge] WS-Discovery: find ONVIF cameras on the LAN ourselves and add
+    // any not already in the list (resolved anonymously). Together with the
+    // PersistCameras() below, the bridge populates cameras.json itself — no separate
+    // "ONVIF Camera Manager" Edge driver needed. Cameras that require a login fail the
+    // anonymous resolve and are skipped here (credentials come later, via the camera card).
+    // Runs at startup (single-threaded, before the event loop / IPC thread), so cameras
+    // are present at commission time (which the commissioning rule requires).
+    // ------------------------------------------------------------------
+    {
+        onvif_discovered_t found[16];
+        int nf = onvif_ws_discover(found, 16, /*wait_secs=*/4);
+        ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nf);
+        for (int i = 0; i < nf; ++i)
+        {
+            bool known = false;
+            for (const auto & e : cameraList)
+                if (e.dni == found[i].urn || (!e.controlUrl.empty() && e.controlUrl == found[i].control_url))
+                {
+                    known = true;
+                    break;
+                }
+            if (known)
+                continue;
+
+            onvif_resolved_bridge_t res;
+            if (onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res) != ONVIF_BRIDGE_OK)
+            {
+                ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (anonymous resolve failed) — skipping",
+                                found[i].urn);
+                continue;
+            }
+            CameraConfig::CameraEntry e;
+            e.name          = found[i].name[0] ? found[i].name : "ONVIF Camera";
+            e.dni           = found[i].urn;
+            e.controlUrl    = found[i].control_url;
+            e.stream        = "mainstream";
+            e.onvif.rtspUrl = res.rtsp_url;
+            e.onvif.ptzUrl  = res.ptz_url;
+            e.onvif.token   = res.token;
+            ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s",
+                            e.name.c_str(), e.dni.c_str(), e.onvif.rtspUrl.c_str());
+            cameraList.push_back(std::move(e));
+        }
+    }
+
     // Only synthesize a single-camera CLI fallback when cameras.json is ABSENT.
     // A present-but-empty file ("[]") explicitly means "no cameras yet — the Edge
     // driver will add them over IPC", so we must not create a phantom CLI camera
@@ -498,6 +546,10 @@ void ApplicationInit()
     }
 
     ChipLogProgress(Camera, "CameraBridge: %zu camera(s) registered on dynamic endpoints", gBridgedCameras.size());
+
+    // Persist the merged list (cameras.json entries + freshly discovered) so the
+    // discovered cameras survive a restart — i.e. WS-Discovery populates cameras.json.
+    PersistCameras();
 
     // ------------------------------------------------------------------
     // Start the Edge⇄bridge IPC server (ipc/PROTOCOL.md) so the Edge driver can
