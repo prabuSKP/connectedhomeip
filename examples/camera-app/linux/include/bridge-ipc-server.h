@@ -69,6 +69,8 @@ struct Callbacks
     std::function<OpResult(const UpsertRequest &)> upsert;
     std::function<OpResult(const std::string & dni)> remove;
     std::function<size_t()> count; // current camera count, for `ping`
+    // [single_bridge] set one default ONVIF login applied to every camera.
+    std::function<OpResult(const std::string & userid, const std::string & password)> setDefaultCreds;
 };
 
 // Start the accept loop on 0.0.0.0:<port> in a background thread.

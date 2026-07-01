@@ -200,6 +200,20 @@ std::string Dispatch(const std::string & req)
         return FailResponse(hasId, id, r.status.empty() ? "internal_error" : r.status, r.error);
     }
 
+    if (op == "set_default_creds")
+    {
+        // One ONVIF login applied to every camera (the "shared default credentials"
+        // model). Empty userid+password means "all cameras are anonymous".
+        std::string user, pass;
+        ExtractStr(req, "userid", user);
+        ExtractStr(req, "password", pass);
+        OpResult r = gCallbacks.setDefaultCreds ? gCallbacks.setDefaultCreds(user, pass) : OpResult{};
+        if (r.ok)
+            return "{\"v\":1,\"id\":\"" + Escape(id) + "\",\"ok\":true,\"status\":\"" + Escape(r.status) +
+                "\",\"result\":{\"cameras\":" + std::to_string(r.endpoint) + "}}";
+        return FailResponse(hasId, id, r.status.empty() ? "internal_error" : r.status, r.error);
+    }
+
     return FailResponse(hasId, id, "bad_request", "unknown op '" + op + "'");
 }
 
