@@ -90,6 +90,20 @@ executable("chip-camera-app") {
 
   configs += [ ":ffmpeg" ]
 
+  # webrtc-libdatachannel.cpp must catch the std::runtime_error("Track is not open") that
+  # libdatachannel throws when the peer disconnects mid-send. CHIP builds -fno-exceptions, which
+  # turns that throw into std::terminate()/SIGABRT and drops the whole Matter node offline. Enable
+  # exceptions + unwind tables here so the catch works (the throw originates in libdatachannel,
+  # which is built with exceptions, and is caught within our own frame).
+  configs -= [
+    "${build_root}/config/compiler:exceptions_default",
+    "${build_root}/config/compiler:unwind_tables_default",
+  ]
+  configs += [
+    "${build_root}/config/compiler:exceptions",
+    "${build_root}/config/compiler:unwind_tables",
+  ]
+
   # ONVIF bridge: link the daemon's prebuilt self-contained ONVIF lib (PTZ control etc.).
   # x64 (host) uses daemon/libonvif.a; ARM (hub cross-build) uses daemon/arm/libonvif.a
   # (build it with `make -C matter-bridge/daemon CC=matter-bridge/cross/armcc libonvif.a`).
@@ -150,6 +164,17 @@ executable("chip-camera-bridge-app") {
   configs += [ ":config" ]
   configs += [ ":gstreamer" ]
   configs += [ ":ffmpeg" ]
+
+  # See chip-camera-app above: enable exceptions + unwind tables so webrtc-libdatachannel.cpp can
+  # catch libdatachannel's "Track is not open" throw instead of crashing the whole node (SIGABRT).
+  configs -= [
+    "${build_root}/config/compiler:exceptions_default",
+    "${build_root}/config/compiler:unwind_tables_default",
+  ]
+  configs += [
+    "${build_root}/config/compiler:exceptions",
+    "${build_root}/config/compiler:unwind_tables",
+  ]
 
   libs = [ "curl", "onvif" ]
   if (target_cpu == "arm") {

@@ -194,7 +194,17 @@ public:
 
     void SendData(const chip::ByteSpan & data) override
     {
-        if (mTrack && mTrack->isOpen())
+        if (!(mTrack && mTrack->isOpen()))
+        {
+            ChipLogError(Camera, "Track is closed");
+            return;
+        }
+        // The isOpen() check above is racy: SendData runs on the GStreamer streaming thread while
+        // libdatachannel closes the track on its own worker thread when the peer disconnects. If the
+        // track closes in that window, mTrack->send() throws std::runtime_error("Track is not open").
+        // An uncaught throw here aborts the whole process (SIGABRT) and takes the Matter node offline,
+        // so swallow it and drop the frame instead.
+        try
         {
             const std::string kind = mTrack->description().type();
             if (kind == "video" && !mVideoInitDone)
@@ -212,9 +222,9 @@ public:
             std::memcpy(frame.data(), data.data(), data.size());
             mTrack->send(std::move(frame));
         }
-        else
+        catch (const std::exception & e)
         {
-            ChipLogError(Camera, "Track is closed");
+            ChipLogError(Camera, "Track send dropped (peer closing): %s", e.what());
         }
     }
 
@@ -225,23 +235,32 @@ public:
             ChipLogError(Camera, "Track is closed");
             return;
         }
-
-        const std::string kind = mTrack->description().type();
-        if (kind == "video" && !mVideoInitDone)
+        // See SendData: the IsReady()/isOpen() check is racy against the peer disconnecting on
+        // libdatachannel's worker thread, so mTrack->sendFrame() can throw "Track is not open" here.
+        // Catch it — an uncaught throw on this (GStreamer) thread aborts the process and drops the node.
+        try
         {
-            InitH264Packetizer();
-            mVideoInitDone = true;
+            const std::string kind = mTrack->description().type();
+            if (kind == "video" && !mVideoInitDone)
+            {
+                InitH264Packetizer();
+                mVideoInitDone = true;
+            }
+            else if (kind == "audio" && !mAudioInitDone)
+            {
+                InitOpusPacketizer();
+                mAudioInitDone = true;
+            }
+            // Feed RAW H.264 access unit. Packetizer does NAL split, FU-A/STAP-A, RTP headers, marker bit, SR/NACK.
+            rtc::binary frame(data.size());
+            std::memcpy(frame.data(), data.data(), data.size());
+            rtc::FrameInfo info(timestamp);
+            mTrack->sendFrame(std::move(frame), info);
         }
-        else if (kind == "audio" && !mAudioInitDone)
+        catch (const std::exception & e)
         {
-            InitOpusPacketizer();
-            mAudioInitDone = true;
+            ChipLogError(Camera, "Track sendFrame dropped (peer closing): %s", e.what());
         }
-        // Feed RAW H.264 access unit. Packetizer does NAL split, FU-A/STAP-A, RTP headers, marker bit, SR/NACK.
-        rtc::binary frame(data.size());
-        std::memcpy(frame.data(), data.data(), data.size());
-        rtc::FrameInfo info(timestamp);
-        mTrack->sendFrame(std::move(frame), info);
     }
 
     bool IsReady() override { return mTrack != nullptr && mTrack->isOpen(); }
