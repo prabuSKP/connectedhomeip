@@ -67,6 +67,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <unistd.h> // _exit
 #include <vector>
 
 using namespace chip;
@@ -782,10 +783,16 @@ void ApplicationShutdown()
     // remove can mutate the camera list while we tear it down below.
     BridgeIpc::Stop();
 
-    // Close WebRTC connections while the Matter SystemLayer is still running so
-    // that WebRTC callbacks (e.g. OnConnectionStateChanged) can use ScheduleLambda.
+    // Unregister each camera's BridgedDeviceBasicInformation from the global cluster registry
+    // BEFORE its backend is freed (the runtime remove path already does this). Otherwise the
+    // freed registration stays linked in the ServerClusterInterfaceRegistry and its static
+    // destructor dereferences a dangling node at process exit. Also close WebRTC connections
+    // here while the Matter SystemLayer is still running so WebRTC callbacks can use ScheduleLambda.
     for (auto & cam : gBridgedCameras)
+    {
+        cam->Unregister();
         cam->Shutdown();
+    }
 
     gBridgedCameras.clear();
 
@@ -800,6 +807,16 @@ int main(int argc, char * argv[])
     InitializeTlsClientManagement();
     InitializeTlsCertificateManagement();
 
-    ChipLinuxAppMainLoop();
-    return 0;
+    ChipLinuxAppMainLoop(); // runs ApplicationShutdown + persists KVS/fabric/counters before returning
+
+    // Skip C++ static/global destructors on the way out. CHIP's global
+    // ServerClusterInterfaceRegistry destructor walks its registration list and calls
+    // Shutdown() on each entry, but the static-destruction order of that singleton relative
+    // to the (also static) camera/registry objects is undefined — some cluster objects are
+    // already gone, so it dereferences a dangling node and SIGSEGVs at every process exit.
+    // All meaningful persistence (KVS, fabric, counters) already happened in the main loop's
+    // shutdown above; there is nothing left to flush, so exit immediately and let the OS
+    // reclaim memory/fds. (Do not add a trailing return — it would be unreachable and trip
+    // -Wunreachable-code/-Werror.)
+    _exit(0);
 }
