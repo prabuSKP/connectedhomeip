@@ -63,6 +63,7 @@
 #include <platform/PlatformManager.h>
 
 #include <atomic>
+#include <cctype>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -177,6 +178,59 @@ std::vector<std::unique_ptr<BridgedCamera>> gBridgedCameras;
 
 // Camera count published to the `ping` health response (read from the IPC thread).
 std::atomic<size_t> gCameraCount{ 0 };
+
+// [single_bridge] One default ONVIF login applied to EVERY camera, set from the Matter
+// Bridge card. Persisted to /data so it survives restart and is used by WS-Discovery.
+std::string gDefaultUser;
+std::string gDefaultPass;
+constexpr const char * kDefaultCredsPath = "/data/onvif-bridge/default_creds";
+
+void LoadDefaultCreds()
+{
+    std::ifstream f(kDefaultCredsPath);
+    if (!f.is_open())
+        return;
+    std::getline(f, gDefaultUser);
+    std::getline(f, gDefaultPass);
+    ChipLogProgress(Camera, "CameraBridge: loaded default ONVIF creds (user='%s')", gDefaultUser.c_str());
+}
+
+void SaveDefaultCreds()
+{
+    std::ofstream f(kDefaultCredsPath, std::ios::trunc);
+    if (f.is_open())
+        f << gDefaultUser << "\n" << gDefaultPass << "\n";
+}
+
+// Derive a STABLE camera identity that survives DHCP IP changes and, for cameras that
+// regenerate their ONVIF UUID on every reboot, URN changes too. RFC-4122 UUIDs carry the
+// NIC MAC in their last 12 hex "node" digits, and cheap ONVIF cameras keep that MAC stable
+// even when the rest of the UUID (and the IP) churns. Keying identity on the MAC means one
+// physical camera stays ONE bridged device (stable DNI + Matter UniqueID) instead of
+// spawning a duplicate on every reconnect.
+//   "urn:uuid:49fc6875-2d80-811c-e367-98eb03ed535f" -> "onvif-mac-98eb03ed535f"
+// Ids we can't parse (already-normalized, or non-UUID DNIs) are returned unchanged.
+std::string StableCameraId(const std::string & id)
+{
+    if (id.rfind("onvif-mac-", 0) == 0)
+        return id; // already stable
+    const std::string pfx = "urn:uuid:";
+    if (id.size() < pfx.size() || id.compare(0, pfx.size(), pfx) != 0)
+        return id;
+    std::string hex;
+    for (size_t i = pfx.size(); i < id.size(); ++i)
+    {
+        char c = id[i];
+        if (c == '-')
+            continue;
+        if (!std::isxdigit(static_cast<unsigned char>(c)))
+            return id; // not a clean UUID — leave as-is
+        hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (hex.size() != 32)
+        return id;
+    return "onvif-mac-" + hex.substr(20); // last 12 hex = MAC / UUID node
+}
 
 // ---------------------------------------------------------------------------
 // Add one bridged camera endpoint.
@@ -355,9 +409,13 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
         return out;
     }
 
+    // Key on the stable MAC-derived identity so a re-onboard after a reboot/IP change
+    // updates the existing camera instead of creating a duplicate (see StableCameraId).
+    std::string sid = StableCameraId(req.dni);
+
     CameraConfig::CameraEntry entry;
     entry.name          = req.name.empty() ? std::string("Camera") : req.name;
-    entry.dni           = req.dni;
+    entry.dni           = sid;
     entry.controlUrl    = req.controlUrl;
     entry.stream        = req.stream.empty() ? std::string("mainstream") : req.stream;
     entry.onvif.rtspUrl = res.rtsp_url;
@@ -366,8 +424,8 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.onvif.user    = req.userid;
     entry.onvif.pass    = req.password;
 
-    // Replace any existing camera with the same DNI (idempotent re-onboard).
-    RemoveCameraByDni(req.dni);
+    // Replace any existing camera with the same stable identity (idempotent re-onboard).
+    RemoveCameraByDni(sid);
 
     int endpoint = AddCamera(entry);
     if (endpoint < 0)
@@ -397,6 +455,74 @@ BridgeIpc::OpResult HandleIpcRemove(const std::string & dni)
     PersistCameras();
     out.ok     = true;
     out.status = "removed";
+    return out;
+}
+
+// [single_bridge] Apply ONE default ONVIF login to EVERY camera (from the Matter Bridge
+// card): store + persist it, then re-resolve each camera with it. Per camera we fall back
+// to an anonymous resolve if the creds fail, so an anonymous camera is never broken.
+// Runs on the IPC thread (blocking SOAP off the Matter loop; endpoint mutations under StackLock).
+BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::string & pass)
+{
+    BridgeIpc::OpResult out;
+    gDefaultUser = user;
+    gDefaultPass = pass;
+    SaveDefaultCreds();
+    ChipLogProgress(Camera, "CameraBridge: set_default_creds user='%s' pass=%s -> re-resolving all cameras",
+                    user.c_str(), pass.empty() ? "(blank)" : "***");
+
+    // Snapshot identity/source of each camera so we don't iterate the live list while mutating it.
+    struct Snap { std::string dni, controlUrl, name, stream; };
+    std::vector<Snap> snap;
+    for (const auto & c : gBridgedCameras)
+    {
+        const auto & e = c->GetEntry();
+        snap.push_back({ e.dni, e.controlUrl, e.name, e.stream });
+    }
+
+    int applied = 0;
+    for (const auto & s : snap)
+    {
+        if (s.controlUrl.empty())
+            continue;
+        int wantMain = (s.stream != "substream") ? 1 : 0;
+        onvif_resolved_bridge_t res;
+        std::string u = user, p = pass;
+        int rc = onvif_resolve_bridge(s.controlUrl.c_str(), u.c_str(), p.c_str(), wantMain, &res);
+        if (rc != ONVIF_BRIDGE_OK && !(user.empty() && pass.empty()))
+        {
+            u.clear(); // creds rejected — fall back to anonymous so we never break a working camera
+            p.clear();
+            rc = onvif_resolve_bridge(s.controlUrl.c_str(), "", "", wantMain, &res);
+        }
+        if (rc != ONVIF_BRIDGE_OK)
+        {
+            ChipLogError(Camera, "CameraBridge: set_default_creds re-resolve failed for %s (rc=%d) — left unchanged",
+                         s.dni.c_str(), rc);
+            continue;
+        }
+        CameraConfig::CameraEntry ne;
+        ne.name          = s.name;
+        ne.dni           = s.dni;
+        ne.controlUrl    = s.controlUrl;
+        ne.stream        = s.stream.empty() ? std::string("mainstream") : s.stream;
+        ne.onvif.rtspUrl = res.rtsp_url;
+        ne.onvif.ptzUrl  = res.ptz_url;
+        ne.onvif.token   = res.token;
+        ne.onvif.user    = u;
+        ne.onvif.pass    = p;
+        RemoveCameraByDni(s.dni);
+        if (AddCamera(ne) >= 0)
+        {
+            applied++;
+            ChipLogProgress(Camera, "CameraBridge: re-resolved %s with %s creds -> rtsp=%s user='%s'", s.dni.c_str(),
+                            u.empty() ? "anonymous" : "default", ne.onvif.rtspUrl.c_str(), u.c_str());
+        }
+    }
+    PersistCameras();
+    out.ok       = true;
+    out.status   = "creds_applied";
+    out.endpoint = applied; // carried back as result.cameras in the response
     return out;
 }
 
@@ -465,14 +591,47 @@ void ApplicationInit()
     // ------------------------------------------------------------------
     auto cameraList = CameraConfig::LoadFromFile();
 
+    // [single_bridge] Load the one default ONVIF login (set from the Matter Bridge card)
+    // so WS-Discovery below can resolve auth cameras with it.
+    LoadDefaultCreds();
+
+    // [single_bridge] Collapse pre-existing duplicates. Earlier builds keyed a camera on its
+    // ONVIF URN + IP, both of which change when a camera reboots (fresh UUID) or takes a new
+    // DHCP lease — so one physical camera could accumulate several entries (and several
+    // SmartThings cards) over reconnects. Re-key every entry on its STABLE identity (MAC) and
+    // drop duplicates, keeping the first occurrence.
+    {
+        std::vector<CameraConfig::CameraEntry> deduped;
+        deduped.reserve(cameraList.size());
+        for (auto & e : cameraList)
+        {
+            std::string sid = StableCameraId(e.dni);
+            bool dup        = false;
+            for (const auto & d : deduped)
+                if (StableCameraId(d.dni) == sid)
+                {
+                    dup = true;
+                    break;
+                }
+            if (dup)
+            {
+                ChipLogProgress(Camera, "CameraBridge: dropping duplicate camera entry %s (stable id %s)", e.dni.c_str(),
+                                sid.c_str());
+                continue;
+            }
+            e.dni = sid; // migrate the persisted DNI to the stable form
+            deduped.push_back(e);
+        }
+        cameraList.swap(deduped);
+    }
+
     // ------------------------------------------------------------------
-    // [single_bridge] WS-Discovery: find ONVIF cameras on the LAN ourselves and add
-    // any not already in the list (resolved anonymously). Together with the
-    // PersistCameras() below, the bridge populates cameras.json itself — no separate
-    // "ONVIF Camera Manager" Edge driver needed. Cameras that require a login fail the
-    // anonymous resolve and are skipped here (credentials come later, via the camera card).
-    // Runs at startup (single-threaded, before the event loop / IPC thread), so cameras
-    // are present at commission time (which the commissioning rule requires).
+    // [single_bridge] WS-Discovery: find ONVIF cameras on the LAN ourselves and add any
+    // not already in the list, resolved with the default ONVIF login (falling back to
+    // anonymous). Together with the PersistCameras() below, the bridge populates
+    // cameras.json itself — no separate "ONVIF Camera Manager" Edge driver needed. Runs at
+    // startup (single-threaded, before the event loop / IPC thread), so cameras are present
+    // at commission time (which the commissioning rule requires).
     // ------------------------------------------------------------------
     {
         onvif_discovered_t found[16];
@@ -480,33 +639,83 @@ void ApplicationInit()
         ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nf);
         for (int i = 0; i < nf; ++i)
         {
-            bool known = false;
-            for (const auto & e : cameraList)
-                if (e.dni == found[i].urn || (!e.controlUrl.empty() && e.controlUrl == found[i].control_url))
+            std::string sid = StableCameraId(found[i].urn);
+
+            // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
+            CameraConfig::CameraEntry * match = nullptr;
+            for (auto & e : cameraList)
+                if (StableCameraId(e.dni) == sid)
                 {
-                    known = true;
+                    match = &e;
                     break;
                 }
-            if (known)
-                continue;
 
-            onvif_resolved_bridge_t res;
-            if (onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res) != ONVIF_BRIDGE_OK)
+            if (match != nullptr)
             {
-                ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (anonymous resolve failed) — skipping",
+                match->dni = sid; // migrate any old full-URN dni to the stable form
+                // Same physical camera. If its control URL (DHCP IP) changed, re-resolve and
+                // update it IN PLACE so a reconnect doesn't spawn a duplicate bridged camera.
+                if (match->controlUrl != found[i].control_url)
+                {
+                    onvif_resolved_bridge_t res;
+                    std::string cu = match->onvif.user.empty() ? gDefaultUser : match->onvif.user;
+                    std::string cp = match->onvif.pass.empty() ? gDefaultPass : match->onvif.pass;
+                    int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+                    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+                    {
+                        cu.clear();
+                        cp.clear();
+                        drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
+                    }
+                    if (drc == ONVIF_BRIDGE_OK)
+                    {
+                        ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)", sid.c_str(),
+                                        match->controlUrl.c_str(), found[i].control_url);
+                        match->controlUrl    = found[i].control_url;
+                        match->onvif.rtspUrl = res.rtsp_url;
+                        match->onvif.ptzUrl  = res.ptz_url;
+                        match->onvif.token   = res.token;
+                        match->onvif.user    = cu;
+                        match->onvif.pass    = cp;
+                    }
+                    else
+                    {
+                        ChipLogProgress(Camera, "CameraBridge: camera %s new IP %s failed to resolve — keeping previous",
+                                        sid.c_str(), found[i].control_url);
+                    }
+                }
+                continue;
+            }
+
+            // Resolve with the default ONVIF login if one is set, else anonymously
+            // (and fall back to anonymous if the default creds are rejected).
+            onvif_resolved_bridge_t res;
+            std::string cu = gDefaultUser, cp = gDefaultPass;
+            int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+            if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+            {
+                cu.clear();
+                cp.clear();
+                drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
+            }
+            if (drc != ONVIF_BRIDGE_OK)
+            {
+                ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (resolve failed) — skipping",
                                 found[i].urn);
                 continue;
             }
             CameraConfig::CameraEntry e;
             e.name          = found[i].name[0] ? found[i].name : "ONVIF Camera";
-            e.dni           = found[i].urn;
+            e.dni           = sid;
             e.controlUrl    = found[i].control_url;
             e.stream        = "mainstream";
             e.onvif.rtspUrl = res.rtsp_url;
             e.onvif.ptzUrl  = res.ptz_url;
             e.onvif.token   = res.token;
-            ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s",
-                            e.name.c_str(), e.dni.c_str(), e.onvif.rtspUrl.c_str());
+            e.onvif.user    = cu;
+            e.onvif.pass    = cp;
+            ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
+                            e.onvif.rtspUrl.c_str());
             cameraList.push_back(std::move(e));
         }
     }
@@ -559,6 +768,8 @@ void ApplicationInit()
     ipcCallbacks.upsert = [](const BridgeIpc::UpsertRequest & req) { return HandleIpcUpsert(req); };
     ipcCallbacks.remove = [](const std::string & dni) { return HandleIpcRemove(dni); };
     ipcCallbacks.count  = []() -> size_t { return gCameraCount.load(); };
+    ipcCallbacks.setDefaultCreds =
+        [](const std::string & u, const std::string & p) { return HandleSetDefaultCreds(u, p); };
     if (!BridgeIpc::Start(9444, std::move(ipcCallbacks)))
     {
         ChipLogError(Camera, "CameraBridge: IPC server failed to start on :9444 (runtime add/remove disabled)");
