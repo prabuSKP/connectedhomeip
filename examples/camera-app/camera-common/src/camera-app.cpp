@@ -45,13 +45,24 @@ CameraApp::CameraApp(chip::EndpointId aClustersEndpoint, CameraDeviceInterface *
     // Instantiate Chime Server
     mChimeServerPtr = std::make_unique<ChimeServer>(mEndpoint, mCameraDevice->GetChimeDelegate());
 
-    Clusters::PushAvStreamTransport::SetDelegate(mEndpoint, &(mCameraDevice->GetPushAVTransportDelegate()));
-
-    Clusters::PushAvStreamTransport::SetTLSClientManagementDelegate(mEndpoint,
-                                                                    &Clusters::TlsClientManagementCommandDelegate::GetInstance());
-
-    Clusters::PushAvStreamTransport::SetTLSCertificateManagementDelegate(
-        mEndpoint, &Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
+    // Register the Push AV Stream Transport cluster ON THIS (dynamic) endpoint via the server-cluster
+    // registry — that is what puts 0x0555 in the endpoint's ServerList, which is what makes SmartThings
+    // enable the videoCapture2 capability (the Record button + the camera-card thumbnail). The upstream
+    // CodegenIntegration only instantiates this cluster on the fixed ZAP endpoint (which the bridge
+    // disables), so the old bare SetDelegate(mEndpoint,...) failed with "no valid endpoint index".
+    // featureMap = 3 (kPerZoneSensitivity | kMetadata) mirrors the fixed-endpoint ZAP default.
+    {
+        BitFlags<PushAvStreamTransport::Feature> pushAvFeatures;
+        pushAvFeatures.Set(PushAvStreamTransport::Feature::kPerZoneSensitivity);
+        pushAvFeatures.Set(PushAvStreamTransport::Feature::kMetadata);
+        mPushAvStreamTransportServer.Create(mEndpoint, pushAvFeatures);
+        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(mPushAvStreamTransportServer.Registration()));
+        auto & pushAvCluster = mPushAvStreamTransportServer.Cluster();
+        pushAvCluster.SetDelegate(&(mCameraDevice->GetPushAVTransportDelegate()));
+        pushAvCluster.SetTLSClientManagementDelegate(&Clusters::TlsClientManagementCommandDelegate::GetInstance());
+        pushAvCluster.SetTLSCertificateManagementDelegate(&Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
+        TEMPORARY_RETURN_IGNORED pushAvCluster.Init();
+    }
 
     // Fetch all initialization parameters for CameraAVSettingsUserLevelMgmt Server
     BitFlags<CameraAvSettingsUserLevelManagement::Feature, uint32_t> avsumFeatures(
@@ -348,6 +359,13 @@ void CameraApp::ShutdownCameraDeviceClusters()
         ChipLogError(Camera, "CameraAVSettingsUserLevelMgmt Server unregister error: %" CHIP_ERROR_FORMAT, err.Format());
     }
     mAVSettingsUserLevelMgmtServer.Destroy();
+
+    err = CodegenDataModelProvider::Instance().Registry().Unregister(&mPushAvStreamTransportServer.Cluster());
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(Camera, "PushAvStreamTransport Server unregister error: %" CHIP_ERROR_FORMAT, err.Format());
+    }
+    mPushAvStreamTransportServer.Destroy();
 }
 
 static constexpr EndpointId kCameraEndpointId = 1;
