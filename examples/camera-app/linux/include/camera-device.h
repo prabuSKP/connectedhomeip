@@ -28,7 +28,11 @@
 #include "default-media-controller.h"
 #include <protocols/interaction_model/StatusCode.h>
 
+#include <atomic>
+#include <chrono>
 #include <gst/gst.h>
+#include <mutex>
+#include <vector>
 #define STREAM_GST_DEST_IP "127.0.0.1"
 #define VIDEO_STREAM_GST_DEST_PORT 5000
 #define AUDIO_STREAM_GST_DEST_PORT 5001
@@ -82,6 +86,7 @@ struct OnvifConfig
 {
     std::string rtspUrl;     // RTSP stream URL, e.g. rtsp://192.168.1.100/live/ch00_0
     std::string ptzUrl;      // ONVIF PTZ service URL
+    std::string snapshotUrl; // ONVIF GetSnapshotUri JPEG URL ("" if unsupported)
     std::string token;       // ONVIF profile token
     std::string user;
     std::string pass;
@@ -351,6 +356,19 @@ public:
     // On-demand pipeline: number of active consumers (live viewers + recorder) per
     // video stream ID. The GStreamer pipeline is built on 0->1 and torn down on ->0.
     std::map<uint16_t, int> mVideoStreamConsumers;
+
+    // Count of live video pipelines currently running. Read from the Matter thread
+    // (CaptureSnapshot) to avoid opening a competing snapshot RTSP session while a viewer is
+    // streaming (cheap cameras allow very few concurrent RTSP sessions); atomic so that read
+    // doesn't race the media-thread mutations of mVideoStreamConsumers.
+    std::atomic<int> mActiveVideoStreams{ 0 };
+
+    // Latest H.264 keyframe (Annex-B, SPS/PPS inline) seen on the live pipeline, plus when it was
+    // captured. Snapshots decode this instead of opening a second RTSP session while streaming, so
+    // the thumbnail never starves live view; when idle and this is stale, a fresh RTSP grab refreshes it.
+    std::mutex mKeyframeMutex;
+    std::vector<uint8_t> mLastLiveKeyframe;
+    std::chrono::steady_clock::time_point mLastLiveKeyframeTime;
 
 private:
     OnvifConfig mOnvifConfig; // per-instance ONVIF config; set via SetOnvifConfig() before Init()

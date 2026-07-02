@@ -419,11 +419,12 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.dni           = sid;
     entry.controlUrl    = req.controlUrl;
     entry.stream        = req.stream.empty() ? std::string("mainstream") : req.stream;
-    entry.onvif.rtspUrl = res.rtsp_url;
-    entry.onvif.ptzUrl  = res.ptz_url;
-    entry.onvif.token   = res.token;
-    entry.onvif.user    = req.userid;
-    entry.onvif.pass    = req.password;
+    entry.onvif.rtspUrl     = res.rtsp_url;
+    entry.onvif.ptzUrl      = res.ptz_url;
+    entry.onvif.snapshotUrl = res.snapshot_url;
+    entry.onvif.token       = res.token;
+    entry.onvif.user        = req.userid;
+    entry.onvif.pass        = req.password;
 
     // Replace any existing camera with the same stable identity (idempotent re-onboard).
     RemoveCameraByDni(sid);
@@ -507,11 +508,12 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
         ne.dni           = s.dni;
         ne.controlUrl    = s.controlUrl;
         ne.stream        = s.stream.empty() ? std::string("mainstream") : s.stream;
-        ne.onvif.rtspUrl = res.rtsp_url;
-        ne.onvif.ptzUrl  = res.ptz_url;
-        ne.onvif.token   = res.token;
-        ne.onvif.user    = u;
-        ne.onvif.pass    = p;
+        ne.onvif.rtspUrl     = res.rtsp_url;
+        ne.onvif.ptzUrl      = res.ptz_url;
+        ne.onvif.snapshotUrl = res.snapshot_url;
+        ne.onvif.token       = res.token;
+        ne.onvif.user        = u;
+        ne.onvif.pass        = p;
         RemoveCameraByDni(s.dni);
         if (AddCamera(ne) >= 0)
         {
@@ -672,12 +674,13 @@ void ApplicationInit()
                     {
                         ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)", sid.c_str(),
                                         match->controlUrl.c_str(), found[i].control_url);
-                        match->controlUrl    = found[i].control_url;
-                        match->onvif.rtspUrl = res.rtsp_url;
-                        match->onvif.ptzUrl  = res.ptz_url;
-                        match->onvif.token   = res.token;
-                        match->onvif.user    = cu;
-                        match->onvif.pass    = cp;
+                        match->controlUrl        = found[i].control_url;
+                        match->onvif.rtspUrl     = res.rtsp_url;
+                        match->onvif.ptzUrl      = res.ptz_url;
+                        match->onvif.snapshotUrl = res.snapshot_url;
+                        match->onvif.token       = res.token;
+                        match->onvif.user        = cu;
+                        match->onvif.pass        = cp;
                     }
                     else
                     {
@@ -710,11 +713,12 @@ void ApplicationInit()
             e.dni           = sid;
             e.controlUrl    = found[i].control_url;
             e.stream        = "mainstream";
-            e.onvif.rtspUrl = res.rtsp_url;
-            e.onvif.ptzUrl  = res.ptz_url;
-            e.onvif.token   = res.token;
-            e.onvif.user    = cu;
-            e.onvif.pass    = cp;
+            e.onvif.rtspUrl     = res.rtsp_url;
+            e.onvif.ptzUrl      = res.ptz_url;
+            e.onvif.snapshotUrl = res.snapshot_url;
+            e.onvif.token       = res.token;
+            e.onvif.user        = cu;
+            e.onvif.pass        = cp;
             ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
                             e.onvif.rtspUrl.c_str());
             cameraList.push_back(std::move(e));

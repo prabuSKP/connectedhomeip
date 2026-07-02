@@ -24,6 +24,10 @@
 #include <fcntl.h> // For file descriptor operations
 #include <filesystem>
 #include <fstream>
+#include <functional> // std::hash for the per-camera snapshot path
+#include <mutex>      // background snapshot refresh guard
+#include <set>
+#include <thread>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <iostream>
@@ -31,6 +35,14 @@
 #include <limits.h>          // For PATH_MAX
 #include <linux/videodev2.h> // For V4L2 definitions
 #include <sys/ioctl.h>
+
+// On-demand snapshot/thumbnail: ONVIF snapshot URI (curl) first, else decode one RTSP
+// keyframe (libav h264 decoder) and MJPEG-encode it.
+#include <curl/curl.h>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+}
 
 // File used to store snapshot from stream and return for CaptureSnapshot
 // command.
@@ -126,6 +138,18 @@ GstFlowReturn OnNewVideoSampleFromAppSink(GstAppSink * appsink, gpointer user_da
                          "Dropping video frame with PTS %" G_GUINT64_FORMAT " <= first PTS %" G_GUINT64_FORMAT " for stream %u",
                          rawPts, self->mVideoStreamPtsOffsetMs[videoStreamID], videoStreamID);
         }
+
+        // Cache the latest keyframe (h264parse config-interval=-1 keeps SPS/PPS inline, so it is
+        // decodable standalone) so CaptureSnapshot can produce a thumbnail by decoding it instead of
+        // opening a SECOND RTSP session — this cheap camera allows very few concurrent sessions, and a
+        // competing snapshot RTSP was starving live view.
+        if (!GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT))
+        {
+            std::lock_guard<std::mutex> lk(self->mKeyframeMutex);
+            self->mLastLiveKeyframe.assign(map.data, map.data + map.size);
+            self->mLastLiveKeyframeTime = std::chrono::steady_clock::now();
+        }
+
         gst_buffer_unmap(buffer, &map);
     }
 
@@ -926,6 +950,279 @@ bool CameraDevice::MatchClosestSnapshotParams(const VideoResolutionStruct & requ
     return false;
 }
 
+namespace {
+
+// libcurl sink: append the HTTP body into a std::string.
+size_t SnapCurlWrite(char * ptr, size_t sz, size_t nm, void * ud)
+{
+    static_cast<std::string *>(ud)->append(ptr, sz * nm);
+    return sz * nm;
+}
+
+// Try the camera's ONVIF GetSnapshotUri JPEG endpoint. Fills `out` with JPEG bytes and
+// returns true only on HTTP 200 with a valid JPEG SOI marker (many cheap cameras advertise
+// the URI but return an error page / HTTP 500).
+bool FetchOnvifSnapshot(const std::string & url, const std::string & user, const std::string & pass, std::string & out)
+{
+    if (url.empty())
+        return false;
+    CURL * curl = curl_easy_init();
+    if (!curl)
+        return false;
+    std::string body;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, SnapCurlWrite);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    if (!user.empty())
+    {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, static_cast<long>(CURLAUTH_ANY)); // Basic or Digest
+        curl_easy_setopt(curl, CURLOPT_USERNAME, user.c_str());
+        curl_easy_setopt(curl, CURLOPT_PASSWORD, pass.c_str());
+    }
+    CURLcode rc = curl_easy_perform(curl);
+    long code   = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+    if (rc == CURLE_OK && code == 200 && body.size() > 3 && static_cast<unsigned char>(body[0]) == 0xFF &&
+        static_cast<unsigned char>(body[1]) == 0xD8)
+    {
+        out.swap(body);
+        return true;
+    }
+    return false;
+}
+
+// MJPEG-encode one decoded frame to `path` via libav. The decoded H.264 frame is YUV420P;
+// the MJPEG encoder wants YUVJ420P (identical layout, JPEG/full range) so we just relabel it.
+bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
+{
+    const AVCodec * enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!enc)
+        return false;
+    AVCodecContext * ectx = avcodec_alloc_context3(enc);
+    if (!ectx)
+        return false;
+    ectx->width       = frame->width;
+    ectx->height      = frame->height;
+    ectx->pix_fmt     = AV_PIX_FMT_YUVJ420P;
+    ectx->color_range = AVCOL_RANGE_JPEG;
+    ectx->time_base   = AVRational{ 1, 25 };
+
+    bool ok        = false;
+    AVPacket * pkt = av_packet_alloc();
+    if (pkt && avcodec_open2(ectx, enc, nullptr) == 0)
+    {
+        int savedFmt  = frame->format;
+        int64_t savedPts = frame->pts;
+        frame->format = AV_PIX_FMT_YUVJ420P;
+        frame->pts    = 0;
+        if (avcodec_send_frame(ectx, frame) == 0 && avcodec_receive_packet(ectx, pkt) == 0)
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (f.is_open())
+            {
+                f.write(reinterpret_cast<const char *>(pkt->data), pkt->size);
+                ok = f.good();
+            }
+        }
+        frame->format = savedFmt;
+        frame->pts    = savedPts;
+    }
+    av_packet_free(&pkt);
+    avcodec_free_context(&ectx);
+    return ok;
+}
+
+// Fallback snapshot: pull one H.264 keyframe from RTSP with a short-lived GStreamer pipeline
+// (independent of the live-view path), decode it with libav, and MJPEG-encode to `path`.
+// The hub ships no jpegenc/decoder GStreamer plugins, so decode+encode is done via libav.
+bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & path, int timeoutSec)
+{
+    if (rtspUrl.empty())
+        return false;
+
+    std::string desc = "rtspsrc name=src location=\"" + rtspUrl +
+        "\" protocols=tcp latency=100 ! rtph264depay ! h264parse config-interval=-1 ! "
+        "video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "appsink name=sink emit-signals=false sync=false max-buffers=60 drop=true";
+    GError * gerr         = nullptr;
+    GstElement * pipeline = gst_parse_launch(desc.c_str(), &gerr);
+    if (!pipeline)
+    {
+        if (gerr)
+            g_error_free(gerr);
+        return false;
+    }
+    if (gerr)
+        g_error_free(gerr);
+    GstElement * sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    if (!sink)
+    {
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    const AVCodec * dec   = avcodec_find_decoder(AV_CODEC_ID_H264);
+    AVCodecContext * dctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    AVFrame * frame       = av_frame_alloc();
+    AVPacket * pkt        = av_packet_alloc();
+    bool ok               = false;
+
+    if (dctx && frame && pkt && avcodec_open2(dctx, dec, nullptr) == 0)
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSec);
+        while (!ok && std::chrono::steady_clock::now() < deadline)
+        {
+            GstSample * sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 500 * GST_MSECOND);
+            if (!sample)
+                continue;
+            GstBuffer * buf = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (buf && gst_buffer_map(buf, &map, GST_MAP_READ))
+            {
+                pkt->data = map.data;
+                pkt->size = static_cast<int>(map.size);
+                if (avcodec_send_packet(dctx, pkt) == 0)
+                {
+                    while (avcodec_receive_frame(dctx, frame) == 0)
+                    {
+                        if (EncodeFrameToJpeg(frame, path))
+                        {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+                gst_buffer_unmap(buf, &map);
+            }
+            gst_sample_unref(sample);
+        }
+    }
+
+    if (pkt)
+    {
+        pkt->data = nullptr; // borrowed from the GstBuffer map; don't let av_packet_free touch it
+        pkt->size = 0;
+        av_packet_free(&pkt);
+    }
+    av_frame_free(&frame);
+    if (dctx)
+        avcodec_free_context(&dctx);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(sink);
+    gst_object_unref(pipeline);
+    return ok;
+}
+
+// De-duplicate concurrent background snapshot refreshes by output path. Process-global (not a
+// CameraDevice member) so a detached refresh thread never touches a possibly-destroyed device.
+std::mutex gSnapBusyMutex;
+std::set<std::string> gSnapBusyPaths;
+
+bool TrySnapshotBegin(const std::string & path)
+{
+    std::lock_guard<std::mutex> lk(gSnapBusyMutex);
+    return gSnapBusyPaths.insert(path).second; // true = we own this refresh
+}
+void SnapshotEnd(const std::string & path)
+{
+    std::lock_guard<std::mutex> lk(gSnapBusyMutex);
+    gSnapBusyPaths.erase(path);
+}
+
+// Hybrid on-demand snapshot: ONVIF snapshot URI first (camera-produced JPEG, no local
+// decode), else decode one RTSP keyframe. Writes a JPEG to `path`.
+// Decode a single H.264 access unit (Annex-B with SPS/PPS inline) to a JPEG file via libav.
+bool DecodeAuToJpeg(const uint8_t * au, size_t auSize, const std::string & path)
+{
+    if (au == nullptr || auSize == 0)
+        return false;
+    const AVCodec * dec   = avcodec_find_decoder(AV_CODEC_ID_H264);
+    AVCodecContext * dctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    AVFrame * frame       = av_frame_alloc();
+    AVPacket * pkt        = av_packet_alloc();
+    bool ok               = false;
+    if (dctx && frame && pkt && avcodec_open2(dctx, dec, nullptr) == 0)
+    {
+        pkt->data = const_cast<uint8_t *>(au);
+        pkt->size = static_cast<int>(auSize);
+        if (avcodec_send_packet(dctx, pkt) == 0)
+        {
+            avcodec_send_packet(dctx, nullptr); // flush so the single frame is emitted
+            while (avcodec_receive_frame(dctx, frame) == 0)
+            {
+                if (EncodeFrameToJpeg(frame, path))
+                {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (pkt)
+    {
+        pkt->data = nullptr; // borrowed
+        pkt->size = 0;
+        av_packet_free(&pkt);
+    }
+    av_frame_free(&frame);
+    if (dctx)
+        avcodec_free_context(&dctx);
+    return ok;
+}
+
+// Hybrid on-demand snapshot: ONVIF snapshot URI (camera-produced JPEG) first; else decode the most
+// recent LIVE keyframe (no extra RTSP session); else — only when nothing is streaming — a short
+// dedicated RTSP grab. The cached-keyframe path is what stops the thumbnail from starving this
+// session-limited camera's live view once it has streamed at least once.
+bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & cachedKeyframe, bool liveActive,
+                          bool cacheFresh, const std::string & path)
+{
+    std::string jpeg;
+    if (FetchOnvifSnapshot(cfg.snapshotUrl, cfg.user, cfg.pass, jpeg))
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (f.is_open())
+        {
+            f.write(jpeg.data(), static_cast<std::streamsize>(jpeg.size()));
+            if (f.good())
+            {
+                ChipLogProgress(Camera, "Snapshot: ONVIF snapshot URI -> %s (%zu bytes)", path.c_str(), jpeg.size());
+                return true;
+            }
+        }
+    }
+    // While streaming (or if a viewer just did), the cached live keyframe is current — decode it and
+    // never open a competing RTSP session.
+    if ((liveActive || cacheFresh) && !cachedKeyframe.empty() && DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path))
+    {
+        ChipLogProgress(Camera, "Snapshot: decoded cached live keyframe -> %s", path.c_str());
+        return true;
+    }
+    // Idle + stale (nobody streaming, cache old/empty): grab a FRESH frame with a short dedicated RTSP
+    // session. Safe from contention because nothing else is using the camera right now.
+    if (!liveActive && SnapshotViaRtsp(cfg.rtspUrl, path, /*timeoutSec=*/3))
+    {
+        ChipLogProgress(Camera, "Snapshot: refreshed via dedicated RTSP keyframe -> %s", path.c_str());
+        return true;
+    }
+    // Last resort: a stale cached frame beats no thumbnail (e.g. a viewer is mid-negotiation).
+    if (!cachedKeyframe.empty() && DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path))
+    {
+        ChipLogProgress(Camera, "Snapshot: decoded stale cached keyframe (fallback) -> %s", path.c_str());
+        return true;
+    }
+    ChipLogProgress(Camera, "Snapshot: not produced this pass (liveActive=%d, hadCachedKeyframe=%d) — will retry",
+                    liveActive ? 1 : 0, cachedKeyframe.empty() ? 0 : 1);
+    return false;
+}
+
+} // namespace
+
 CameraError CameraDevice::CaptureSnapshot(const chip::app::DataModel::Nullable<uint16_t> streamID,
                                           const VideoResolutionStruct & resolution, ImageSnapshot & outImageSnapshot)
 {
@@ -956,11 +1253,58 @@ CameraError CameraDevice::CaptureSnapshot(const chip::app::DataModel::Nullable<u
         matchedCodec = it->snapshotStreamParams.imageCodec;
     }
 
-    // Read from image file stored from snapshot stream.
-    std::ifstream file(SNAPSHOT_FILE_PATH, std::ios::binary | std::ios::ate);
+    // Serve a cached JPEG and refresh it in the BACKGROUND. CaptureSnapshot runs on the Matter
+    // event loop, so it must not block on RTSP/curl I/O (that would stall the node and drop it
+    // offline). The refresh thread touches only value-captured copies + process-global state, so
+    // it is safe even if this CameraDevice is destroyed while it runs. Cache lives in tmpfs
+    // (no flash wear, auto-cleaned on reboot); the atomic rename means readers never see a
+    // partial file.
+    std::error_code snapEc;
+    std::filesystem::create_directories("/tmp/onvif-bridge", snapEc);
+    std::string snapPath =
+        "/tmp/onvif-bridge/snapshot_" + std::to_string(std::hash<std::string>{}(mOnvifConfig.rtspUrl)) + ".jpg";
+
+    // Refresh at most once per TTL, on a detached thread. GenerateSnapshotJpeg picks a source that
+    // never fights live view: it prefers the cached live keyframe (no RTSP) and only opens a
+    // dedicated RTSP session when nothing is streaming. Snapshot copies of the config + latest
+    // keyframe are captured by value so the thread is safe even if this CameraDevice is destroyed.
+    constexpr auto kSnapshotTtlSec = 10;
+    bool liveActive                = mActiveVideoStreams.load() > 0;
+    bool stale                     = true;
+    {
+        std::error_code e;
+        auto mtime = std::filesystem::last_write_time(snapPath, e);
+        if (!e)
+            stale = (std::filesystem::file_time_type::clock::now() - mtime) > std::chrono::seconds(kSnapshotTtlSec);
+    }
+    if (stale && TrySnapshotBegin(snapPath))
+    {
+        OnvifConfig cfgCopy = mOnvifConfig;
+        std::vector<uint8_t> keyframeCopy;
+        bool cacheFresh = false;
+        {
+            std::lock_guard<std::mutex> lk(mKeyframeMutex);
+            keyframeCopy = mLastLiveKeyframe;
+            if (!mLastLiveKeyframe.empty())
+                cacheFresh = (std::chrono::steady_clock::now() - mLastLiveKeyframeTime) < std::chrono::seconds(60);
+        }
+        std::string tmpPath = snapPath + ".tmp";
+        std::thread([cfgCopy, keyframeCopy, liveActive, cacheFresh, snapPath, tmpPath]() {
+            std::error_code e;
+            if (GenerateSnapshotJpeg(cfgCopy, keyframeCopy, liveActive, cacheFresh, tmpPath))
+                std::filesystem::rename(tmpPath, snapPath, e); // atomic swap-in
+            else
+                std::filesystem::remove(tmpPath, e);
+            SnapshotEnd(snapPath);
+        }).detach();
+    }
+
+    // Return the most recent cached JPEG. On the very first request (none cached yet) this
+    // fails; the controller retries and gets the image once the background refresh finishes.
+    std::ifstream file(snapPath, std::ios::binary | std::ios::ate);
     if (!file.is_open())
     {
-        ChipLogError(Camera, "Error opening snapshot image file: ");
+        ChipLogProgress(Camera, "Snapshot not ready yet (refreshing in background): %s", snapPath.c_str());
         return CameraError::ERROR_CAPTURE_SNAPSHOT_FAILED;
     }
 
@@ -1103,6 +1447,7 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
     // Store in stream context (keep it even if the live source is still negotiating).
     it->videoContext            = videoPipeline;
     mVideoStreamConsumers[streamID] = 1; // first consumer
+    mActiveVideoStreams.fetch_add(1);    // a live pipeline now holds an RTSP session
 
     if (state == GST_STATE_PLAYING)
     {
@@ -1150,6 +1495,8 @@ CameraError CameraDevice::StopVideoStream(uint16_t streamID)
         return CameraError::SUCCESS;
     }
     mVideoStreamConsumers.erase(streamID);
+    if (mActiveVideoStreams.load() > 0)
+        mActiveVideoStreams.fetch_sub(1); // last consumer left; the live RTSP session is freed
 
     GstElement * videoPipeline = reinterpret_cast<GstElement *>(it->videoContext);
     if (videoPipeline != nullptr)

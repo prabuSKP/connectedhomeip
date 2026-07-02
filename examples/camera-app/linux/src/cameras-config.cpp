@@ -101,9 +101,10 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
         entry.dni          = ExtractField(obj, "dni");
         entry.controlUrl   = ExtractField(obj, "control_url");
         entry.stream       = ExtractField(obj, "stream");
-        entry.onvif.rtspUrl = ExtractField(obj, "rtsp");
-        entry.onvif.ptzUrl  = ExtractField(obj, "ptz");
-        entry.onvif.token   = ExtractField(obj, "token");
+        entry.onvif.rtspUrl     = ExtractField(obj, "rtsp");
+        entry.onvif.ptzUrl      = ExtractField(obj, "ptz");
+        entry.onvif.snapshotUrl = ExtractField(obj, "snapshot");
+        entry.onvif.token       = ExtractField(obj, "token");
         entry.onvif.user    = ExtractField(obj, "user");
         entry.onvif.pass    = ExtractField(obj, "pass");
 
@@ -156,6 +157,7 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
              << ", \"dni\": \"" << c.dni << "\""
              << ", \"rtsp\": \"" << src << "\""
              << ", \"ptz\": \"" << c.onvif.ptzUrl << "\""
+             << ", \"snapshot\": \"" << c.onvif.snapshotUrl << "\""
              << ", \"token\": \"" << c.onvif.token << "\""
              << ", \"user\": \"" << c.onvif.user << "\""
              << ", \"pass\": \"" << c.onvif.pass << "\""
