@@ -21,6 +21,8 @@
 #include <app-common/zap-generated/cluster-objects.h>
 #include <app/clusters/push-av-stream-transport-server/constants.h>
 #include <lib/core/TLVTags.h>
+#include <algorithm>
+#include <string>
 #include <vector>
 
 namespace chip {
@@ -349,8 +351,11 @@ struct TransportOptionsStorage : public TransportOptionsStruct
 
         expiryTime = aTransportOptionsStorage.expiryTime;
 
-        // Copy video streams storage
+        // Copy video streams storage (names must be re-pointed at OUR string copies, not the
+        // source's — see RepointStreamNames)
         mVideoStreamsStorage = aTransportOptionsStorage.mVideoStreamsStorage;
+        mVideoStreamNames    = aTransportOptionsStorage.mVideoStreamNames;
+        RepointVideoStreamNames();
         if (!mVideoStreamsStorage.empty())
         {
             videoStreams.SetValue(
@@ -363,6 +368,8 @@ struct TransportOptionsStorage : public TransportOptionsStruct
 
         // Copy audio streams storage
         mAudioStreamsStorage = aTransportOptionsStorage.mAudioStreamsStorage;
+        mAudioStreamNames    = aTransportOptionsStorage.mAudioStreamNames;
+        RepointAudioStreamNames();
         if (!mAudioStreamsStorage.empty())
         {
             audioStreams.SetValue(
@@ -398,41 +405,58 @@ struct TransportOptionsStorage : public TransportOptionsStruct
 
         expiryTime = transportOptions.expiryTime;
 
-        // Handle videoStreams from decodable type
+        // Handle videoStreams from decodable type. The decoded structs' videoStreamName spans
+        // point into the caller's TLV buffer (command payload or persistence scratch buffer);
+        // copy the names into owned strings and re-point, or they dangle once that buffer is
+        // freed (reading them in the reboot restore path crashed the node).
         if (transportOptions.videoStreams.HasValue())
         {
             mVideoStreamsStorage.clear();
+            mVideoStreamNames.clear();
             auto iter = transportOptions.videoStreams.Value().begin();
             while (iter.Next())
             {
                 auto & videoStream = iter.GetValue();
+                mVideoStreamNames.emplace_back(videoStream.videoStreamName.empty()
+                                                   ? std::string()
+                                                   : std::string(videoStream.videoStreamName.data(),
+                                                                 videoStream.videoStreamName.size()));
                 mVideoStreamsStorage.push_back(videoStream);
             }
+            RepointVideoStreamNames();
             videoStreams.SetValue(
                 DataModel::List<const Structs::VideoStreamStruct::Type>(mVideoStreamsStorage.data(), mVideoStreamsStorage.size()));
         }
         else
         {
             mVideoStreamsStorage.clear();
+            mVideoStreamNames.clear();
             videoStreams.ClearValue();
         }
 
-        // Handle audioStreams from decodable type
+        // Handle audioStreams from decodable type (same dangling-span hazard as videoStreams)
         if (transportOptions.audioStreams.HasValue())
         {
             mAudioStreamsStorage.clear();
+            mAudioStreamNames.clear();
             auto iter = transportOptions.audioStreams.Value().begin();
             while (iter.Next())
             {
                 auto & audioStream = iter.GetValue();
+                mAudioStreamNames.emplace_back(audioStream.audioStreamName.empty()
+                                                   ? std::string()
+                                                   : std::string(audioStream.audioStreamName.data(),
+                                                                 audioStream.audioStreamName.size()));
                 mAudioStreamsStorage.push_back(audioStream);
             }
+            RepointAudioStreamNames();
             audioStreams.SetValue(
                 DataModel::List<const Structs::AudioStreamStruct::Type>(mAudioStreamsStorage.data(), mAudioStreamsStorage.size()));
         }
         else
         {
             mAudioStreamsStorage.clear();
+            mAudioStreamNames.clear();
             audioStreams.ClearValue();
         }
 
@@ -445,12 +469,18 @@ struct TransportOptionsStorage : public TransportOptionsStruct
     void ClearVideoStreams()
     {
         mVideoStreamsStorage.clear();
+        mVideoStreamNames.clear();
         videoStreams.ClearValue();
     }
 
     void AddVideoStream(const Structs::VideoStreamStruct::Type & videoStream)
     {
+        mVideoStreamNames.emplace_back(
+            videoStream.videoStreamName.empty()
+                ? std::string()
+                : std::string(videoStream.videoStreamName.data(), videoStream.videoStreamName.size()));
         mVideoStreamsStorage.push_back(videoStream);
+        RepointVideoStreamNames();
         videoStreams.SetValue(
             DataModel::List<const Structs::VideoStreamStruct::Type>(mVideoStreamsStorage.data(), mVideoStreamsStorage.size()));
     }
@@ -472,12 +502,18 @@ struct TransportOptionsStorage : public TransportOptionsStruct
     void ClearAudioStreams()
     {
         mAudioStreamsStorage.clear();
+        mAudioStreamNames.clear();
         audioStreams.ClearValue();
     }
 
     void AddAudioStream(const Structs::AudioStreamStruct::Type & audioStream)
     {
+        mAudioStreamNames.emplace_back(
+            audioStream.audioStreamName.empty()
+                ? std::string()
+                : std::string(audioStream.audioStreamName.data(), audioStream.audioStreamName.size()));
         mAudioStreamsStorage.push_back(audioStream);
+        RepointAudioStreamNames();
         audioStreams.SetValue(
             DataModel::List<const Structs::AudioStreamStruct::Type>(mAudioStreamsStorage.data(), mAudioStreamsStorage.size()));
     }
@@ -496,11 +532,35 @@ struct TransportOptionsStorage : public TransportOptionsStruct
     }
 
 private:
+    // Rewrite every stream struct's name span to point at the owned string copies. Must be
+    // called after ANY mutation of the streams/names vectors: a push_back can reallocate both
+    // the struct vector and the names vector (short strings live inside std::string itself and
+    // move with it), so spans set earlier may be stale.
+    void RepointVideoStreamNames()
+    {
+        size_t count = std::min(mVideoStreamsStorage.size(), mVideoStreamNames.size());
+        for (size_t i = 0; i < count; i++)
+        {
+            mVideoStreamsStorage[i].videoStreamName = CharSpan(mVideoStreamNames[i].data(), mVideoStreamNames[i].size());
+        }
+    }
+
+    void RepointAudioStreamNames()
+    {
+        size_t count = std::min(mAudioStreamsStorage.size(), mAudioStreamNames.size());
+        for (size_t i = 0; i < count; i++)
+        {
+            mAudioStreamsStorage[i].audioStreamName = CharSpan(mAudioStreamNames[i].data(), mAudioStreamNames[i].size());
+        }
+    }
+
     char mUrlBuffer[kMaxUrlLength];
     TransportTriggerOptionsStorage mTriggerOptionsStorage;
     ContainerOptionsStorage mContainerOptionsStorage;
     std::vector<Structs::VideoStreamStruct::Type> mVideoStreamsStorage;
     std::vector<Structs::AudioStreamStruct::Type> mAudioStreamsStorage;
+    std::vector<std::string> mVideoStreamNames;
+    std::vector<std::string> mAudioStreamNames;
 };
 
 /**

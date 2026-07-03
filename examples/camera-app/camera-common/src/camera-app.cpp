@@ -45,24 +45,12 @@ CameraApp::CameraApp(chip::EndpointId aClustersEndpoint, CameraDeviceInterface *
     // Instantiate Chime Server
     mChimeServerPtr = std::make_unique<ChimeServer>(mEndpoint, mCameraDevice->GetChimeDelegate());
 
-    // Register the Push AV Stream Transport cluster ON THIS (dynamic) endpoint via the server-cluster
-    // registry — that is what puts 0x0555 in the endpoint's ServerList, which is what makes SmartThings
-    // enable the videoCapture2 capability (the Record button + the camera-card thumbnail). The upstream
-    // CodegenIntegration only instantiates this cluster on the fixed ZAP endpoint (which the bridge
-    // disables), so the old bare SetDelegate(mEndpoint,...) failed with "no valid endpoint index".
-    // featureMap = 3 (kPerZoneSensitivity | kMetadata) mirrors the fixed-endpoint ZAP default.
-    {
-        BitFlags<PushAvStreamTransport::Feature> pushAvFeatures;
-        pushAvFeatures.Set(PushAvStreamTransport::Feature::kPerZoneSensitivity);
-        pushAvFeatures.Set(PushAvStreamTransport::Feature::kMetadata);
-        mPushAvStreamTransportServer.Create(mEndpoint, pushAvFeatures);
-        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(mPushAvStreamTransportServer.Registration()));
-        auto & pushAvCluster = mPushAvStreamTransportServer.Cluster();
-        pushAvCluster.SetDelegate(&(mCameraDevice->GetPushAVTransportDelegate()));
-        pushAvCluster.SetTLSClientManagementDelegate(&Clusters::TlsClientManagementCommandDelegate::GetInstance());
-        pushAvCluster.SetTLSCertificateManagementDelegate(&Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
-        TEMPORARY_RETURN_IGNORED pushAvCluster.Init();
-    }
+    // NOTE: Push AV Stream Transport (0x0555) is wired in InitCameraDeviceClusters(), NOT here.
+    // Its Init() re-allocates transports persisted in CurrentConnections, and resolving their
+    // video/audio stream IDs needs the CameraAVStreamManagement cluster to exist (the delegate's
+    // cluster back-pointer is wired in its constructor) with its persisted allocated streams
+    // loaded. Wiring PushAV from this constructor crashed on every boot that followed a
+    // recording: restore -> SetVideoStream -> GetAllocatedVideoStreams() on a null cluster.
 
     // Fetch all initialization parameters for CameraAVSettingsUserLevelMgmt Server
     BitFlags<CameraAvSettingsUserLevelManagement::Feature, uint32_t> avsumFeatures(
@@ -324,6 +312,49 @@ void CameraApp::InitCameraDeviceClusters()
 
     CreateAndInitializeCameraAVStreamMgmt();
 
+    // Push AV Stream Transport (0x0555) must be served ON THIS endpoint — its presence in the
+    // endpoint's ServerList is what makes SmartThings enable videoCapture2 (Record button +
+    // camera-card thumbnail). Two cases:
+    //  - Standalone camera-app: ZAP/CodegenIntegration already instantiated the cluster on the
+    //    fixed endpoint; just wire our delegates into that instance (a second Register would
+    //    collide and leave the live instance delegate-less).
+    //  - Bridge: the fixed ZAP endpoint is disabled and cameras live on dynamic endpoints, where
+    //    no instance exists — create + register one ourselves. featureMap = 3
+    //    (kPerZoneSensitivity | kMetadata) mirrors the fixed-endpoint ZAP default.
+    // Ordering constraints (both variants): this must run AFTER CreateAndInitializeCameraAVStreamMgmt()
+    // — PushAV Init() re-allocates transports persisted in CurrentConnections, which resolves their
+    // stream IDs against the AVStreamMgmt cluster's loaded allocated streams — and the TLS delegates
+    // must be set BEFORE the PushAV delegate, because SetDelegate()/Init() is what triggers that
+    // restore and restored transports look up their upload certs through the TLS delegates.
+    if (CodegenDataModelProvider::Instance().Registry().Get({ mEndpoint, PushAvStreamTransport::Id }) != nullptr)
+    {
+        Clusters::PushAvStreamTransport::SetTLSClientManagementDelegate(
+            mEndpoint, &Clusters::TlsClientManagementCommandDelegate::GetInstance());
+        Clusters::PushAvStreamTransport::SetTLSCertificateManagementDelegate(
+            mEndpoint, &Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
+        Clusters::PushAvStreamTransport::SetDelegate(mEndpoint, &(mCameraDevice->GetPushAVTransportDelegate()));
+    }
+    else
+    {
+        BitFlags<PushAvStreamTransport::Feature> pushAvFeatures;
+        pushAvFeatures.Set(PushAvStreamTransport::Feature::kPerZoneSensitivity);
+        pushAvFeatures.Set(PushAvStreamTransport::Feature::kMetadata);
+        mPushAvStreamTransportServer.Create(mEndpoint, pushAvFeatures);
+        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(mPushAvStreamTransportServer.Registration()));
+        auto & pushAvCluster = mPushAvStreamTransportServer.Cluster();
+        pushAvCluster.SetTLSClientManagementDelegate(&Clusters::TlsClientManagementCommandDelegate::GetInstance());
+        pushAvCluster.SetTLSCertificateManagementDelegate(&Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
+        pushAvCluster.SetDelegate(&(mCameraDevice->GetPushAVTransportDelegate()));
+        TEMPORARY_RETURN_IGNORED pushAvCluster.Init();
+
+        // The controller provisions the Push AV upload TLS material (root CA, client cert, upload
+        // destination) via TlsCertificateManagement (0x0801) + TlsClientManagement (0x0802) on the
+        // SAME endpoint as the camera. Without these, SmartThings aborts clip recording before ever
+        // sending AllocatePushTransport ("Certificate not provisioned").
+        Clusters::AddTlsCertificateManagementEndpoint(mEndpoint);
+        Clusters::AddTlsClientManagementEndpoint(mEndpoint);
+    }
+
     // Set the WebRTCTransportProvider server in the manager
     mCameraDevice->SetWebRTCTransportProvider(&mWebRTCTransportProviderServer.Cluster());
 
@@ -360,12 +391,22 @@ void CameraApp::ShutdownCameraDeviceClusters()
     }
     mAVSettingsUserLevelMgmtServer.Destroy();
 
-    err = CodegenDataModelProvider::Instance().Registry().Unregister(&mPushAvStreamTransportServer.Cluster());
-    if (err != CHIP_NO_ERROR)
+    // Only tear down the PushAV instance if WE created it (bridge dynamic endpoint); the
+    // standalone camera-app's instance is owned and shut down by CodegenIntegration.
+    if (mPushAvStreamTransportServer.IsConstructed())
     {
-        ChipLogError(Camera, "PushAvStreamTransport Server unregister error: %" CHIP_ERROR_FORMAT, err.Format());
+        err = CodegenDataModelProvider::Instance().Registry().Unregister(&mPushAvStreamTransportServer.Cluster());
+        if (err != CHIP_NO_ERROR)
+        {
+            ChipLogError(Camera, "PushAvStreamTransport Server unregister error: %" CHIP_ERROR_FORMAT, err.Format());
+        }
+        mPushAvStreamTransportServer.Destroy();
     }
-    mPushAvStreamTransportServer.Destroy();
+
+    // Tear down the per-endpoint TLS cluster instances (no-ops on the standalone camera-app,
+    // where the fixed-endpoint instances are owned by CodegenIntegration).
+    Clusters::RemoveTlsCertificateManagementEndpoint(mEndpoint);
+    Clusters::RemoveTlsClientManagementEndpoint(mEndpoint);
 }
 
 static constexpr EndpointId kCameraEndpointId = 1;

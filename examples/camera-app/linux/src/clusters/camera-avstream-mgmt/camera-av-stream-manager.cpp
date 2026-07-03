@@ -146,12 +146,28 @@ CHIP_ERROR CameraAVStreamManager::ValidateStreamUsage(StreamUsageEnum streamUsag
 const std::vector<chip::app::Clusters::CameraAvStreamManagement::VideoStreamStruct> &
 CameraAVStreamManager::GetAllocatedVideoStreams() const
 {
+    // The cluster back-pointer is only wired once CameraAVStreamManagementCluster is constructed
+    // (CameraApp::CreateAndInitializeCameraAVStreamMgmt). Callers reachable before that — e.g. the
+    // PushAV persisted-transport restore — must see "no streams", not a null dereference that
+    // crash-loops the node on every boot.
+    if (GetCameraAVStreamManagementCluster() == nullptr)
+    {
+        ChipLogError(Camera, "GetAllocatedVideoStreams called before CameraAVStreamManagementCluster exists");
+        static const std::vector<chip::app::Clusters::CameraAvStreamManagement::VideoStreamStruct> kNoVideoStreams;
+        return kNoVideoStreams;
+    }
     return GetCameraAVStreamManagementCluster()->GetAllocatedVideoStreams();
 }
 
 const std::vector<chip::app::Clusters::CameraAvStreamManagement::AudioStreamStruct> &
 CameraAVStreamManager::GetAllocatedAudioStreams() const
 {
+    if (GetCameraAVStreamManagementCluster() == nullptr)
+    {
+        ChipLogError(Camera, "GetAllocatedAudioStreams called before CameraAVStreamManagementCluster exists");
+        static const std::vector<chip::app::Clusters::CameraAvStreamManagement::AudioStreamStruct> kNoAudioStreams;
+        return kNoAudioStreams;
+    }
     return GetCameraAVStreamManagementCluster()->GetAllocatedAudioStreams();
 }
 
