@@ -336,6 +336,26 @@ void CameraApp::InitCameraDeviceClusters()
     }
     else
     {
+        // The TLS clusters must exist — and their certificate table must be endpoint-wired —
+        // BEFORE PushAV Init(). Init() runs the persisted-transport restore, which re-fetches
+        // each restored connection's upload certs from the certificate table, and it is
+        // AddTlsCertificateManagementEndpoint() that calls CertificateTable::SetEndpoint().
+        // Registering the TLS clusters AFTER Init() left the restore reading an unwired
+        // certificate table -> SIGSEGV on the first reboot that followed a recording (a
+        // persisted CurrentConnection is what triggers the restore loop).
+        //
+        // Per the spec these are node-wide SINGLETONS on the ROOT endpoint: the Camera device
+        // type (0x0142) carries mandatory root-node condition requirements (TLSCertificatesCond /
+        // TLSClientCond) and RootNodeDeviceType marks both clusters singleton. SmartThings'
+        // bridged-camera path also looks for them on endpoint 0 and never starts its PAV cert
+        // provisioning if they are absent there ("PAV server CA ID is absent" at capture time).
+        // Register them once for the whole node, not per camera endpoint.
+        if (CodegenDataModelProvider::Instance().Registry().Get({ kRootEndpointId, TlsCertificateManagement::Id }) == nullptr)
+        {
+            Clusters::AddTlsCertificateManagementEndpoint(kRootEndpointId);
+            Clusters::AddTlsClientManagementEndpoint(kRootEndpointId);
+        }
+
         BitFlags<PushAvStreamTransport::Feature> pushAvFeatures;
         pushAvFeatures.Set(PushAvStreamTransport::Feature::kPerZoneSensitivity);
         pushAvFeatures.Set(PushAvStreamTransport::Feature::kMetadata);
@@ -346,20 +366,6 @@ void CameraApp::InitCameraDeviceClusters()
         pushAvCluster.SetTLSCertificateManagementDelegate(&Clusters::TlsCertificateManagementCommandDelegate::GetInstance());
         pushAvCluster.SetDelegate(&(mCameraDevice->GetPushAVTransportDelegate()));
         TEMPORARY_RETURN_IGNORED pushAvCluster.Init();
-
-        // The controller provisions the Push AV upload TLS material (root CA, client cert, upload
-        // destination) via TlsCertificateManagement (0x0801) + TlsClientManagement (0x0802).
-        // Per the spec these are node-wide SINGLETONS on the ROOT endpoint: the Camera device
-        // type (0x0142) carries mandatory root-node condition requirements (TLSCertificatesCond /
-        // TLSClientCond) and RootNodeDeviceType marks both clusters singleton. SmartThings'
-        // bridged-camera path looks for them on endpoint 0 and never starts its PAV cert
-        // provisioning if they are absent there ("PAV server CA ID is absent" at capture time).
-        // Register them once for the whole node, not per camera endpoint.
-        if (CodegenDataModelProvider::Instance().Registry().Get({ kRootEndpointId, TlsCertificateManagement::Id }) == nullptr)
-        {
-            Clusters::AddTlsCertificateManagementEndpoint(kRootEndpointId);
-            Clusters::AddTlsClientManagementEndpoint(kRootEndpointId);
-        }
     }
 
     // Set the WebRTCTransportProvider server in the manager
