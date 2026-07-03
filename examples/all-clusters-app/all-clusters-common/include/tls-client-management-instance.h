@@ -109,6 +109,18 @@ public:
  */
 void InitializeTlsClientManagement();
 
+/**
+ * Serve the TLS Client Management cluster on a DYNAMIC endpoint (e.g. a bridged camera).
+ * The ZAP/CodegenIntegration path only instantiates the cluster on the fixed ZAP endpoint;
+ * a bridge that disables that endpoint must register per-endpoint instances itself so a
+ * controller can provision TLS endpoints for Push AV upload. Also whitelists `endpointId`
+ * in the shared delegate (which otherwise only accepts the fixed ZAP endpoint).
+ */
+void AddTlsClientManagementEndpoint(chip::EndpointId endpointId);
+
+/** Unregister + destroy the dynamic-endpoint instance created by AddTlsClientManagementEndpoint. */
+void RemoveTlsClientManagementEndpoint(chip::EndpointId endpointId);
+
 } // namespace Clusters
 } // namespace app
 } // namespace chip

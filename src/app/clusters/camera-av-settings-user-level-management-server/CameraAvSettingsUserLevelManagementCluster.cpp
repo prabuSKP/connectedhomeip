@@ -63,6 +63,11 @@ CameraAvSettingsUserLevelManagementCluster::ReadAttribute(const DataModel::ReadA
     {
     case Attributes::FeatureMap::Id:
         return aEncoder.Encode(mLogic.mFeatures);
+    case Attributes::ClusterRevision::Id:
+        // Mandatory global attribute; omitting it makes every wildcard read / subscription
+        // priming on this endpoint carry an UNSUPPORTED_ATTRIBUTE error entry, which some
+        // controllers treat as a failed subscription (breaking their camera setup flows).
+        return aEncoder.Encode(kRevision);
     case Attributes::MPTZPosition::Id:
         return aEncoder.Encode(mLogic.mMptzPosition);
     case Attributes::MaxPresets::Id:

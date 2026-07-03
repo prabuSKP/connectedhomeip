@@ -81,6 +81,18 @@ public:
  */
 void InitializeTlsCertificateManagement();
 
+/**
+ * Serve the TLS Certificate Management cluster on a DYNAMIC endpoint (e.g. a bridged camera).
+ * The ZAP/CodegenIntegration path only instantiates the cluster on the fixed ZAP endpoint;
+ * a bridge that disables that endpoint must register per-endpoint instances itself so a
+ * controller can provision root/client certificates for Push AV upload. Also whitelists
+ * `endpointId` in the shared delegate (which otherwise only accepts the fixed ZAP endpoint).
+ */
+void AddTlsCertificateManagementEndpoint(chip::EndpointId endpointId);
+
+/** Unregister + destroy the dynamic-endpoint instance created by AddTlsCertificateManagementEndpoint. */
+void RemoveTlsCertificateManagementEndpoint(chip::EndpointId endpointId);
+
 } // namespace Clusters
 } // namespace app
 } // namespace chip

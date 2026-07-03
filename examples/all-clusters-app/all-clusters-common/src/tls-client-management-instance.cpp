@@ -24,6 +24,7 @@
 #include <app/clusters/tls-client-management-server/TLSClientManagementCluster.h>
 #include <app/storage/FabricTableImpl.ipp>
 #include <app/util/af-types.h>
+#include <app/server/Server.h>
 #include <clusters/TlsClientManagement/Commands.h>
 #include <data-model-providers/codegen/CodegenDataModelProvider.h>
 #include <lib/support/CHIPMem.h>
@@ -45,6 +46,35 @@ using EndpointSerializer = DefaultSerializer<TlsEndpointId, TLSClientManagementD
 using InnerIterator      = TableEntryDataConvertingIterator<TlsEndpointId, TLSClientManagementDelegate::EndpointStructType>;
 
 namespace {
+
+// Dynamic (bridged) endpoints this cluster additionally serves — see AddTlsClientManagementEndpoint.
+// The delegate below is shared by every instance; its endpoint guards accept the fixed ZAP endpoint
+// (1) plus anything registered here. Persistent state stays keyed to the EndpointId(1) namespace, so
+// all endpoints share one provisioned-TLS-endpoint table (one node, one set of upload destinations).
+constexpr size_t kMaxDynamicTlsEndpoints = 16; // >= the bridge's CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT
+EndpointId gDynamicTlsEndpoints[kMaxDynamicTlsEndpoints] = {
+    kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId,
+    kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId,
+    kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId, kInvalidEndpointId,
+};
+LazyRegisteredServerCluster<TLSClientManagementCluster> gDynamicClusterInstances[kMaxDynamicTlsEndpoints];
+
+bool IsManagedTlsEndpoint(EndpointId endpoint)
+{
+    if (endpoint == EndpointId(1))
+    {
+        return true;
+    }
+    for (EndpointId e : gDynamicTlsEndpoints)
+    {
+        if (e == endpoint)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 enum class TagEndpoint : uint8_t
 {
     kTlsEndpointId,
@@ -236,7 +266,7 @@ CHIP_ERROR TlsClientManagementCommandDelegate::Init(PersistentStorageDelegate & 
 CHIP_ERROR TlsClientManagementCommandDelegate::ForEachEndpoint(EndpointId matterEndpoint, FabricIndex fabric,
                                                                LoadedEndpointCallback callback)
 {
-    VerifyOrReturnError(matterEndpoint == EndpointId(1), CHIP_ERROR_INTERNAL);
+    VerifyOrReturnError(IsManagedTlsEndpoint(matterEndpoint), CHIP_ERROR_INTERNAL);
 
     BufferedEndpoint endpoint;
     return mProvisioned.IterateEntries(fabric, endpoint.mBuffer, [&](auto & iterator) {
@@ -263,7 +293,7 @@ ClusterStatusCode TlsClientManagementCommandDelegate::ProvisionEndpoint(
     EndpointId matterEndpoint, FabricIndex fabric,
     const TlsClientManagement::Commands::ProvisionEndpoint::DecodableType & provisionReq, uint16_t & endpointID)
 {
-    VerifyOrReturnError(matterEndpoint == EndpointId(1), ClusterStatusCode(Status::ConstraintError));
+    VerifyOrReturnError(IsManagedTlsEndpoint(matterEndpoint), ClusterStatusCode(Status::ConstraintError));
     VerifyOrReturnError(mStorage != nullptr, ClusterStatusCode(Status::ConstraintError));
 
     // Find existing value to update & check for port/name collisions
@@ -330,7 +360,7 @@ ClusterStatusCode TlsClientManagementCommandDelegate::ProvisionEndpoint(
 CHIP_ERROR TlsClientManagementCommandDelegate::FindProvisionedEndpointByID(EndpointId matterEndpoint, FabricIndex fabric,
                                                                            uint16_t endpointID, LoadedEndpointCallback callback)
 {
-    VerifyOrReturnError(matterEndpoint == EndpointId(1), CHIP_ERROR_INTERNAL);
+    VerifyOrReturnError(IsManagedTlsEndpoint(matterEndpoint), CHIP_ERROR_INTERNAL);
 
     TlsEndpointId localId(endpointID);
     BufferedEndpoint endpoint;
@@ -341,7 +371,7 @@ CHIP_ERROR TlsClientManagementCommandDelegate::FindProvisionedEndpointByID(Endpo
 Status TlsClientManagementCommandDelegate::RemoveProvisionedEndpointByID(EndpointId matterEndpoint, FabricIndex fabric,
                                                                          uint16_t endpointID)
 {
-    VerifyOrReturnError(matterEndpoint == EndpointId(1), Status::ConstraintError);
+    VerifyOrReturnError(IsManagedTlsEndpoint(matterEndpoint), Status::ConstraintError);
     VerifyOrReturnError(mStorage != nullptr, Status::ConstraintError);
 
     BufferedEndpoint endpoint;
@@ -351,7 +381,10 @@ Status TlsClientManagementCommandDelegate::RemoveProvisionedEndpointByID(Endpoin
     VerifyOrReturnValue(result == CHIP_NO_ERROR, Status::Failure);
     VerifyOrReturnValue(endpoint.mEndpoint.referenceCount == 0, Status::InvalidInState);
 
-    UniquePtr<GlobalEndpointData> globalData(New<GlobalEndpointData>(matterEndpoint));
+    // Global endpoint-ID data is always stored under the fixed EndpointId(1) namespace (see
+    // GetEndpointId/RemoveFabric); key by that — not matterEndpoint — so removal works when this
+    // delegate serves a dynamic (bridged) endpoint too.
+    UniquePtr<GlobalEndpointData> globalData(New<GlobalEndpointData>(EndpointId(1)));
     VerifyOrReturnError(globalData, Status::ResourceExhausted);
     ReturnValueOnFailure(globalData->Load(mStorage), Status::Failure);
     result = globalData->Remove(*mStorage, mProvisioned, fabric, endpointID);
@@ -441,6 +474,54 @@ void InitializeTlsClientManagement()
 {
     MatterTlsClientManagementSetDelegate(TlsClientManagementCommandDelegate::GetInstance());
     MatterTlsClientManagementSetCertificateTable(gCertificateTableInstance);
+}
+
+void AddTlsClientManagementEndpoint(EndpointId endpointId)
+{
+    VerifyOrReturn(!IsManagedTlsEndpoint(endpointId),
+                   ChipLogProgress(Zcl, "TlsClientManagement: endpoint %u already served", endpointId));
+
+    for (size_t i = 0; i < kMaxDynamicTlsEndpoints; i++)
+    {
+        if (gDynamicTlsEndpoints[i] != kInvalidEndpointId)
+        {
+            continue;
+        }
+        // Certificate lookups share the fixed EndpointId(1) storage namespace (matches the ZAP
+        // endpoint keying used by CodegenIntegration and the delegate's global-data keys).
+        LogErrorOnFailure(gCertificateTableInstance.SetEndpoint(EndpointId(1)));
+
+        TLSClientManagementCluster::Context context{ Server::GetInstance().GetFabricTable() };
+        gDynamicClusterInstances[i].Create(context, endpointId, TlsClientManagementCommandDelegate::GetInstance(),
+                                           gCertificateTableInstance, static_cast<uint8_t>(kMaxProvisionedEndpoints));
+        CHIP_ERROR err = CodegenDataModelProvider::Instance().Registry().Register(gDynamicClusterInstances[i].Registration());
+        if (err != CHIP_NO_ERROR)
+        {
+            ChipLogError(Zcl, "TlsClientManagement: register on endpoint %u failed: %" CHIP_ERROR_FORMAT, endpointId,
+                         err.Format());
+            gDynamicClusterInstances[i].Destroy();
+            return;
+        }
+        gDynamicTlsEndpoints[i] = endpointId;
+        ChipLogProgress(Zcl, "TlsClientManagement: serving dynamic endpoint %u", endpointId);
+        return;
+    }
+    ChipLogError(Zcl, "TlsClientManagement: no free slot for dynamic endpoint %u", endpointId);
+}
+
+void RemoveTlsClientManagementEndpoint(EndpointId endpointId)
+{
+    for (size_t i = 0; i < kMaxDynamicTlsEndpoints; i++)
+    {
+        if (gDynamicTlsEndpoints[i] != endpointId)
+        {
+            continue;
+        }
+        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Unregister(&gDynamicClusterInstances[i].Cluster()));
+        gDynamicClusterInstances[i].Destroy();
+        gDynamicTlsEndpoints[i] = kInvalidEndpointId;
+        return;
+    }
 }
 
 } // namespace Clusters

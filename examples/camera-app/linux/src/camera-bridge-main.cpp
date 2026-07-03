@@ -268,9 +268,15 @@ int AddCameraEndpoint(BridgedCamera * cam, EndpointId parentId)
                 // BridgedDeviceBasicInformation (0x0039): gives this bridged camera
                 // a unique node label + uniqueId so the controller shows a distinct
                 // card per camera.  Required for the Bridged Node device type.
+                // SoftwareVersion(+String) must be served: the SmartThings camera plugin
+                // subscribes to attr 0x09 during setup and, if it errors, the whole
+                // subscription dies and the plugin's setup (incl. its record of the
+                // provisioned Push AV CA ids) is aborted -> "PAV server CA ID is absent".
                 LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(
                     cam->CreateBridgedDeviceInfo(gCurrentEndpointId, { .reachable = true, .nodeLabel = cam->GetName() },
-                                                 { .uniqueId = cam->GetUniqueId() })));
+                                                 { .uniqueId              = cam->GetUniqueId(),
+                                                   .softwareVersion      = static_cast<uint32_t>(1),
+                                                   .softwareVersionString = std::string("1.0") })));
 
                 // Register all camera clusters for this endpoint via the registry.
                 cam->InitClusters(gCurrentEndpointId);
