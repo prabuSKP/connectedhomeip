@@ -183,6 +183,12 @@ private:
 
     // Map to track active connection timeout timers for cancellation
     std::unordered_map<uint16_t, ConnectionTimeoutContext *> mConnectionTimerContexts;
+
+    // Same, for the proactive-ICE timers armed after each Answer. Tracked so they can be
+    // cancelled when the session (or the whole camera) is torn down within the ~2.5 s window —
+    // otherwise the timer fires on a freed manager/session (use-after-free).
+    std::unordered_map<uint16_t, ConnectionTimeoutContext *> mProactiveIceTimerContexts;
+    void CancelProactiveICECandidatesTimer(uint16_t sessionId);
 };
 
 } // namespace WebRTCTransportProvider

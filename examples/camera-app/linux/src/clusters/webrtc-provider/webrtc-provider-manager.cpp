@@ -158,6 +158,13 @@ void WebRTCProviderManager::CloseConnection()
         CancelConnectionTimer(mConnectionTimerContexts.begin()->first);
     }
 
+    // Same for proactive-ICE timers — must be cancelled before this manager (and its
+    // CameraDevice) is destroyed, or a timer that fires afterwards dereferences freed memory.
+    while (!mProactiveIceTimerContexts.empty())
+    {
+        CancelProactiveICECandidatesTimer(mProactiveIceTimerContexts.begin()->first);
+    }
+
     // Clean up all the Webrtc Transports
     mWebrtcTransportMap.clear();
     mSessionIdMap.clear();
@@ -1020,6 +1027,10 @@ void WebRTCProviderManager::OnDeviceConnectionFailure(void * context, const Scop
 
 void WebRTCProviderManager::CleanupSession(uint16_t sessionId)
 {
+    // Always cancel a pending proactive-ICE timer for this session, even if the transport is
+    // already gone — the timer may have been armed at Answer time before the transport existed.
+    CancelProactiveICECandidatesTimer(sessionId);
+
     WebrtcTransport * transport = GetTransport(sessionId);
     if (transport == nullptr)
     {
@@ -1407,6 +1418,9 @@ void WebRTCProviderManager::OnConnectionTimeoutCallback(chip::System::Layer * sy
 
 void WebRTCProviderManager::StartProactiveICECandidatesTimer(uint16_t sessionId)
 {
+    // Replace any existing armed timer for this session (avoid leaking the old ctx).
+    CancelProactiveICECandidatesTimer(sessionId);
+
     auto * ctx     = chip::Platform::New<ConnectionTimeoutContext>();
     ctx->manager   = this;
     ctx->sessionId = sessionId;
@@ -1419,6 +1433,24 @@ void WebRTCProviderManager::StartProactiveICECandidatesTimer(uint16_t sessionId)
         ChipLogError(Camera, "Failed to start proactive ICE-candidate timer for session %u: %" CHIP_ERROR_FORMAT, sessionId,
                      err.Format());
         chip::Platform::Delete(ctx);
+        return;
+    }
+    // Track it so CloseConnection() can cancel+free it if the session/camera is torn down before
+    // the 2.5 s elapses — otherwise the timer fires on a freed manager (use-after-free).
+    mProactiveIceTimerContexts[sessionId] = ctx;
+}
+
+void WebRTCProviderManager::CancelProactiveICECandidatesTimer(uint16_t sessionId)
+{
+    auto it = mProactiveIceTimerContexts.find(sessionId);
+    if (it != mProactiveIceTimerContexts.end())
+    {
+        if (DeviceLayer::SystemLayer().IsInitialized())
+        {
+            DeviceLayer::SystemLayer().CancelTimer(OnProactiveICECandidatesTimerFired, it->second);
+        }
+        chip::Platform::Delete(it->second);
+        mProactiveIceTimerContexts.erase(it);
     }
 }
 
@@ -1426,6 +1458,9 @@ void WebRTCProviderManager::OnProactiveICECandidatesTimerFired(chip::System::Lay
 {
     auto * ctx = static_cast<ConnectionTimeoutContext *>(context);
     ChipLogProgress(Camera, "Proactively sending local ICE candidates to controller for session %u", ctx->sessionId);
+    // This timer has fired, so its ctx is no longer pending — drop it from the tracking map
+    // (do NOT cancel; it already fired) before freeing it below.
+    ctx->manager->mProactiveIceTimerContexts.erase(ctx->sessionId);
     ctx->manager->ScheduleICECandidatesSend(ctx->sessionId);
     chip::Platform::Delete(ctx);
 }
