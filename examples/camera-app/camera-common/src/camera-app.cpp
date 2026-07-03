@@ -31,7 +31,6 @@ using namespace chip::app::Clusters::WebRTCTransportProvider;
 using namespace chip::app::Clusters::CameraAvStreamManagement;
 using namespace chip::app::Clusters::ZoneManagement;
 
-static constexpr uint32_t kBitsPerMegabit = 1000000;
 
 template <typename T>
 using List   = chip::app::DataModel::List<T>;
@@ -272,7 +271,10 @@ void CameraApp::CreateAndInitializeCameraAVStreamMgmt()
         ? TwoWayTalkSupportTypeEnum::kFullDuplex
         : TwoWayTalkSupportTypeEnum::kNotSupported;
     std::vector<SnapshotCapabilitiesStruct> snapshotCapabilities = mCameraDevice->GetCameraHALInterface().GetSnapshotCapabilities();
-    uint32_t maxNetworkBandwidth = mCameraDevice->GetCameraHALInterface().GetMaxNetworkBandwidth() * kBitsPerMegabit;
+    // GetMaxNetworkBandwidth() already returns bps (upstream 0debcd9bf6 changed this attribute's
+    // unit from Mbps to bps). Do NOT scale it again — 128000000 * 1000000 overflows uint32 and
+    // wraps to ~1.38 Gbps.
+    uint32_t maxNetworkBandwidth = mCameraDevice->GetCameraHALInterface().GetMaxNetworkBandwidth();
     std::vector<StreamUsageEnum> supportedStreamUsages = mCameraDevice->GetCameraHALInterface().GetSupportedStreamUsages();
     std::vector<StreamUsageEnum> streamUsagePriorities = mCameraDevice->GetCameraHALInterface().GetStreamUsagePriorities();
 
