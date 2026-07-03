@@ -210,7 +210,12 @@ Protocols::InteractionModel::Status PushAvStreamTransportManager::DeallocatePush
         return Status::NotFound;
     }
     mTotalUsedBandwidthbps -= mTransportMap[connectionID].get()->GetCurrentlyUsedBandwidthbps();
-    mMediaController->UnregisterTransport(mTransportMap[connectionID].get());
+    // AllocatePushTransport guards this; mirror the guard here so a Deallocate that races an
+    // uninitialized MediaController can't null-deref.
+    if (mMediaController != nullptr)
+    {
+        mMediaController->UnregisterTransport(mTransportMap[connectionID].get());
+    }
     mTransportMap.erase(connectionID);
     mTransportOptionsMap.erase(connectionID);
 
