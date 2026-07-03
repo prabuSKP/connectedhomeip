@@ -18,6 +18,7 @@
 #include "cameras-config.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <fstream>
 #include <lib/support/logging/CHIPLogging.h>
 #include <sstream>
@@ -27,6 +28,117 @@
 namespace CameraConfig {
 
 namespace {
+
+// Escape a string for embedding as a JSON string value. ONVIF-supplied fields (camera name,
+// URLs) are untrusted and may contain '"', '\\', '}', or control chars — without escaping they
+// would corrupt the file and silently drop cameras on the next load.
+std::string JsonEscape(const std::string & in)
+{
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (unsigned char ch : in)
+    {
+        switch (ch)
+        {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (ch < 0x20)
+            {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                out += buf;
+            }
+            else
+            {
+                out += static_cast<char>(ch);
+            }
+        }
+    }
+    return out;
+}
+
+// Reverse of JsonEscape for the subset we emit (\" \\ \/ \b \f \n \r \t \uXXXX).
+std::string JsonUnescape(const std::string & in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        if (in[i] != '\\' || i + 1 >= in.size())
+        {
+            out += in[i];
+            continue;
+        }
+        char esc = in[++i];
+        switch (esc)
+        {
+        case '"':
+            out += '"';
+            break;
+        case '\\':
+            out += '\\';
+            break;
+        case '/':
+            out += '/';
+            break;
+        case 'b':
+            out += '\b';
+            break;
+        case 'f':
+            out += '\f';
+            break;
+        case 'n':
+            out += '\n';
+            break;
+        case 'r':
+            out += '\r';
+            break;
+        case 't':
+            out += '\t';
+            break;
+        case 'u': {
+            if (i + 4 < in.size())
+            {
+                unsigned int code = 0;
+                if (sscanf(in.c_str() + i + 1, "%4x", &code) == 1)
+                {
+                    // We only ever emit control chars (< 0x80) via \u, so a single byte suffices.
+                    if (code < 0x80)
+                    {
+                        out += static_cast<char>(code);
+                    }
+                    i += 4;
+                }
+            }
+            break;
+        }
+        default:
+            out += esc;
+            break;
+        }
+    }
+    return out;
+}
 
 // Minimal JSON field extractor for the fixed cameras.json format.
 // Finds the value of a key in a JSON object fragment, e.g.
@@ -48,15 +160,30 @@ std::string ExtractField(const std::string & obj, const std::string & key)
     if (openQuote == std::string::npos)
         return {};
 
-    size_t closeQuote = obj.find('"', openQuote + 1);
-    if (closeQuote == std::string::npos)
+    // Find the closing quote, skipping backslash-escaped quotes (\").
+    size_t closeQuote = openQuote + 1;
+    while (closeQuote < obj.size())
+    {
+        if (obj[closeQuote] == '\\')
+        {
+            closeQuote += 2; // skip the escaped char
+            continue;
+        }
+        if (obj[closeQuote] == '"')
+            break;
+        ++closeQuote;
+    }
+    if (closeQuote >= obj.size())
         return {};
 
-    return obj.substr(openQuote + 1, closeQuote - openQuote - 1);
+    return JsonUnescape(obj.substr(openQuote + 1, closeQuote - openQuote - 1));
 }
 
 // Split the top-level JSON array into individual object strings (one per camera).
-// Handles the simple format: [ { ... }, { ... } ]  where objects are not nested.
+// Objects are not nested in our format, but string VALUES may contain '{' or '}' (untrusted
+// ONVIF names/URLs), so brace matching must ignore braces that appear inside a quoted string
+// (respecting backslash escapes) — otherwise a '}' in a value truncates the object and drops
+// the camera on reload.
 std::vector<std::string> SplitObjects(const std::string & json)
 {
     std::vector<std::string> objects;
@@ -67,8 +194,33 @@ std::vector<std::string> SplitObjects(const std::string & json)
         if (open == std::string::npos)
             break;
 
-        // Find matching closing brace (no nesting in our format)
-        size_t close = json.find('}', open + 1);
+        size_t i        = open + 1;
+        bool inString   = false;
+        size_t close    = std::string::npos;
+        for (; i < json.size(); ++i)
+        {
+            char ch = json[i];
+            if (inString)
+            {
+                if (ch == '\\')
+                {
+                    ++i; // skip escaped char
+                    continue;
+                }
+                if (ch == '"')
+                    inString = false;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = true;
+            }
+            else if (ch == '}')
+            {
+                close = i;
+                break;
+            }
+        }
         if (close == std::string::npos)
             break;
 
@@ -151,18 +303,19 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
     file << "[\n";
     for (size_t i = 0; i < cameras.size(); ++i)
     {
-        const auto & c   = cameras[i];
-        const char * src = c.onvif.useTestSrc ? "test" : c.onvif.rtspUrl.c_str();
-        file << "  { \"name\": \"" << c.name << "\""
-             << ", \"dni\": \"" << c.dni << "\""
-             << ", \"rtsp\": \"" << src << "\""
-             << ", \"ptz\": \"" << c.onvif.ptzUrl << "\""
-             << ", \"snapshot\": \"" << c.onvif.snapshotUrl << "\""
-             << ", \"token\": \"" << c.onvif.token << "\""
-             << ", \"user\": \"" << c.onvif.user << "\""
-             << ", \"pass\": \"" << c.onvif.pass << "\""
-             << ", \"control_url\": \"" << c.controlUrl << "\""
-             << ", \"stream\": \"" << (c.stream.empty() ? "mainstream" : c.stream) << "\" }"
+        const auto & c        = cameras[i];
+        std::string src       = c.onvif.useTestSrc ? "test" : c.onvif.rtspUrl;
+        std::string streamVal = c.stream.empty() ? "mainstream" : c.stream;
+        file << "  { \"name\": \"" << JsonEscape(c.name) << "\""
+             << ", \"dni\": \"" << JsonEscape(c.dni) << "\""
+             << ", \"rtsp\": \"" << JsonEscape(src) << "\""
+             << ", \"ptz\": \"" << JsonEscape(c.onvif.ptzUrl) << "\""
+             << ", \"snapshot\": \"" << JsonEscape(c.onvif.snapshotUrl) << "\""
+             << ", \"token\": \"" << JsonEscape(c.onvif.token) << "\""
+             << ", \"user\": \"" << JsonEscape(c.onvif.user) << "\""
+             << ", \"pass\": \"" << JsonEscape(c.onvif.pass) << "\""
+             << ", \"control_url\": \"" << JsonEscape(c.controlUrl) << "\""
+             << ", \"stream\": \"" << JsonEscape(streamVal) << "\" }"
              << (i + 1 < cameras.size() ? "," : "") << "\n";
     }
     file << "]\n";
