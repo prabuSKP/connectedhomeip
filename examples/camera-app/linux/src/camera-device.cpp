@@ -996,42 +996,62 @@ bool FetchOnvifSnapshot(const std::string & url, const std::string & user, const
 
 // MJPEG-encode one decoded frame to `path` via libav. The decoded H.264 frame is YUV420P;
 // the MJPEG encoder wants YUVJ420P (identical layout, JPEG/full range) so we just relabel it.
+// The CaptureSnapshot response has a hard payload limit (~62 KB — the cluster rejects larger
+// files with RESOURCE_EXHAUSTED), so step up the compression until the JPEG fits.
 bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
 {
+    constexpr int kMaxJpegBytes = 60000; // stay under the CaptureSnapshot image limit (63802)
+
     const AVCodec * enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!enc)
         return false;
-    AVCodecContext * ectx = avcodec_alloc_context3(enc);
-    if (!ectx)
-        return false;
-    ectx->width       = frame->width;
-    ectx->height      = frame->height;
-    ectx->pix_fmt     = AV_PIX_FMT_YUVJ420P;
-    ectx->color_range = AVCOL_RANGE_JPEG;
-    ectx->time_base   = AVRational{ 1, 25 };
 
-    bool ok        = false;
-    AVPacket * pkt = av_packet_alloc();
-    if (pkt && avcodec_open2(ectx, enc, nullptr) == 0)
+    bool ok          = false;
+    int savedFmt     = frame->format;
+    int64_t savedPts = frame->pts;
+    frame->format    = AV_PIX_FMT_YUVJ420P;
+    frame->pts       = 0;
+
+    for (int q = 8; q <= 31 && !ok; q += 7) // MJPEG qscale: 1 = best, 31 = smallest
     {
-        int savedFmt  = frame->format;
-        int64_t savedPts = frame->pts;
-        frame->format = AV_PIX_FMT_YUVJ420P;
-        frame->pts    = 0;
-        if (avcodec_send_frame(ectx, frame) == 0 && avcodec_receive_packet(ectx, pkt) == 0)
+        AVCodecContext * ectx = avcodec_alloc_context3(enc);
+        if (!ectx)
+            break;
+        ectx->width          = frame->width;
+        ectx->height         = frame->height;
+        ectx->pix_fmt        = AV_PIX_FMT_YUVJ420P;
+        ectx->color_range    = AVCOL_RANGE_JPEG;
+        ectx->time_base      = AVRational{ 1, 25 };
+        ectx->flags |= AV_CODEC_FLAG_QSCALE;
+        ectx->global_quality = FF_QP2LAMBDA * q;
+
+        AVPacket * pkt = av_packet_alloc();
+        if (pkt && avcodec_open2(ectx, enc, nullptr) == 0)
         {
-            std::ofstream f(path, std::ios::binary | std::ios::trunc);
-            if (f.is_open())
+            frame->quality = FF_QP2LAMBDA * q;
+            if (avcodec_send_frame(ectx, frame) == 0 && avcodec_receive_packet(ectx, pkt) == 0)
             {
-                f.write(reinterpret_cast<const char *>(pkt->data), pkt->size);
-                ok = f.good();
+                if (pkt->size <= kMaxJpegBytes)
+                {
+                    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+                    if (f.is_open())
+                    {
+                        f.write(reinterpret_cast<const char *>(pkt->data), pkt->size);
+                        ok = f.good();
+                    }
+                }
+                else
+                {
+                    ChipLogProgress(Camera, "Snapshot JPEG %d bytes > %d at q=%d; recompressing", pkt->size, kMaxJpegBytes, q);
+                }
             }
         }
-        frame->format = savedFmt;
-        frame->pts    = savedPts;
+        av_packet_free(&pkt);
+        avcodec_free_context(&ectx);
     }
-    av_packet_free(&pkt);
-    avcodec_free_context(&ectx);
+
+    frame->format = savedFmt;
+    frame->pts    = savedPts;
     return ok;
 }
 

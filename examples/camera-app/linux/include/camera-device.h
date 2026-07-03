@@ -250,7 +250,11 @@ public:
     uint8_t GetSpeakerMaxLevel() override { return mSpeakerMaxLevel; }
     uint8_t GetSpeakerMinLevel() override { return mSpeakerMinLevel; }
 
-    // Does camera have a microphone
+    // Does camera have a microphone. Kept true even though our ONVIF cameras have no audio
+    // backchannel: SmartThings' camera plugin rejects clip recording outright ("Unsupported
+    // functionality") for cameras without the audio feature. The Push AV recorder tolerates a
+    // silent audio track (libav's opus encoder is enabled; the DASH muxer emits both init
+    // segments at header time, so an empty audio representation does not stall uploads).
     bool HasMicrophone() override { return true; }
 
     // Mute/Unmute microphone.

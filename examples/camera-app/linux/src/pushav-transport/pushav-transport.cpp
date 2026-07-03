@@ -154,6 +154,14 @@ CHIP_ERROR PushAVTransport::ConfigureRecorderSettings(const TransportOptionsStru
     // Codecs are valid, proceed with configuration
     mClipInfo.mHasAudio      = (transportOptions.audioStreams.HasValue() || transportOptions.audioStreamID.HasValue());
     mClipInfo.mHasVideo      = (transportOptions.videoStreams.HasValue() || transportOptions.videoStreamID.HasValue());
+
+    // Record video-only. The controller requests an audio track (we must advertise the audio
+    // feature or SmartThings rejects clip capture as "Unsupported functionality"), but our ONVIF
+    // cameras have no audio backchannel and the hub has no audio source — an audio track with no
+    // packets yields a 0-byte audio init segment (rejected by the upload endpoint, HTTP 400) and
+    // a broken audio representation in the manifest. Re-enable once real audio flows.
+    mClipInfo.mHasAudio = false;
+
     mSessionStartedTimestamp = std::chrono::system_clock::time_point();
 
     mClipInfo.mUrl         = std::string(transportOptions.url.data(), transportOptions.url.size());

@@ -65,7 +65,11 @@ PushAVClipRecorder::PushAVClipRecorder(ClipInfoStruct & aClipInfo, AudioInfoStru
     mClipInfo.mClipStartPTS = 0;
     mMetadataSet            = false;
     mDeinitializeRecorder   = false;
-    mUploadMPD              = true;
+    // Upload the manifest LAST (the destructor's "final MPD" upload), not first: the SmartThings
+    // clip endpoint treats an index.mpd upload as "clip complete" and rejects init/media segments
+    // that arrive after it (HTTP 400 ClipInPresentState) — losing video.init makes the clip
+    // unplayable.
+    mUploadMPD              = false;
     mCurrentClipStartPts    = AV_NOPTS_VALUE;
     currentPts              = AV_NOPTS_VALUE;
 
