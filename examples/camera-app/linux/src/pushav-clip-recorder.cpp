@@ -556,6 +556,15 @@ RecorderStatus PushAVClipRecorder::AddStreamToOutput(AVMediaType type)
         mVideoStream->codecpar->width     = mVideoInfo.mWidth;
         mVideoStream->codecpar->height    = mVideoInfo.mHeight;
         mVideoStream->avg_frame_rate      = (AVRational){ mVideoInfo.mFrameRate, 1 };
+        if (mVideoStream->codecpar->extradata_size <= 0)
+        {
+            // Without SPS/PPS extradata the DASH init segment has no avcC box and the manifest
+            // says codecs="avc1" (no profile/level), so players reject the clip. find_stream_info
+            // only populates extradata when libavcodec has the extract_extradata BSF
+            // (cross/build-ffmpeg.sh).
+            ChipLogError(Camera,
+                         "H.264 extradata missing - clip will NOT be playable (ffmpeg built without extract_extradata BSF?)");
+        }
     }
     else if (type == AVMEDIA_TYPE_AUDIO)
     {
