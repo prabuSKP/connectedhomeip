@@ -212,6 +212,51 @@ void PushAvStreamTransportServerLogic::LoadPersistentAttributes()
     // Load currentConnections
     LogErrorOnFailure(LoadCurrentConnections());
 
+    // Re-fetch the Push AV upload TLS material for each restored connection, exactly as
+    // HandleAllocatePushTransport does. The controller provisioned it once (persisted by the
+    // TLS clusters) and does NOT re-send AllocatePushTransport after a reboot — it reuses the
+    // existing connection via Modify/Trigger — so without this the delegate re-creates the
+    // transports with empty cert buffers and every clip upload fails the mTLS handshake.
+    if (mTLSClientManagementDelegate != nullptr && mTLSCertificateManagementDelegate != nullptr && mDelegate != nullptr)
+    {
+        for (auto & transportConnection : mCurrentConnections)
+        {
+            const auto transportOptionsPtr = transportConnection.GetTransportOptionsPtr();
+            if (!transportOptionsPtr)
+            {
+                continue;
+            }
+            CHIP_ERROR err = mTLSClientManagementDelegate->FindProvisionedEndpointByID(
+                mEndpointId, transportConnection.GetFabricIndex(), transportOptionsPtr->TLSEndpointID,
+                [&](auto & TLSEndpoint) -> CHIP_ERROR {
+                    VerifyOrReturnError(!TLSEndpoint.ccdid.IsNull(), CHIP_ERROR_INCORRECT_STATE);
+                    // Use heap allocation for large certificate buffers to reduce stack usage
+                    auto rootCertBuffer   = std::make_unique<PersistenceBuffer<CHIP_CONFIG_TLS_PERSISTED_ROOT_CERT_BYTES>>();
+                    auto clientCertBuffer = std::make_unique<PersistenceBuffer<CHIP_CONFIG_TLS_PERSISTED_CLIENT_CERT_BYTES>>();
+
+                    Tls::CertificateTable::BufferedClientCert clientCertEntry(*clientCertBuffer);
+                    Tls::CertificateTable::BufferedRootCert rootCertEntry(*rootCertBuffer);
+
+                    auto & table = mTLSCertificateManagementDelegate->GetCertificateTable();
+                    ReturnErrorOnFailure(table.GetClientCertificateEntry(transportConnection.GetFabricIndex(),
+                                                                         TLSEndpoint.ccdid.Value(), clientCertEntry));
+                    ReturnErrorOnFailure(
+                        table.GetRootCertificateEntry(transportConnection.GetFabricIndex(), TLSEndpoint.caid, rootCertEntry));
+                    mDelegate->SetTLSCerts(clientCertEntry, rootCertEntry);
+                    return CHIP_NO_ERROR;
+                });
+            if (err != CHIP_NO_ERROR)
+            {
+                ChipLogError(Zcl, "Failed to restore TLS certs for connection %u: %" CHIP_ERROR_FORMAT,
+                             transportConnection.connectionID, err.Format());
+            }
+            else
+            {
+                ChipLogProgress(Zcl, "Restored TLS certs for connection %u", transportConnection.connectionID);
+            }
+        }
+    }
+
     // Signal delegate that all persistent configuration attributes have been loaded.
     TEMPORARY_RETURN_IGNORED mDelegate->PersistentAttributesLoadedCallback();
 }
