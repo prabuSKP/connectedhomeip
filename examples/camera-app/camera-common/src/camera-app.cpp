@@ -348,11 +348,18 @@ void CameraApp::InitCameraDeviceClusters()
         TEMPORARY_RETURN_IGNORED pushAvCluster.Init();
 
         // The controller provisions the Push AV upload TLS material (root CA, client cert, upload
-        // destination) via TlsCertificateManagement (0x0801) + TlsClientManagement (0x0802) on the
-        // SAME endpoint as the camera. Without these, SmartThings aborts clip recording before ever
-        // sending AllocatePushTransport ("Certificate not provisioned").
-        Clusters::AddTlsCertificateManagementEndpoint(mEndpoint);
-        Clusters::AddTlsClientManagementEndpoint(mEndpoint);
+        // destination) via TlsCertificateManagement (0x0801) + TlsClientManagement (0x0802).
+        // Per the spec these are node-wide SINGLETONS on the ROOT endpoint: the Camera device
+        // type (0x0142) carries mandatory root-node condition requirements (TLSCertificatesCond /
+        // TLSClientCond) and RootNodeDeviceType marks both clusters singleton. SmartThings'
+        // bridged-camera path looks for them on endpoint 0 and never starts its PAV cert
+        // provisioning if they are absent there ("PAV server CA ID is absent" at capture time).
+        // Register them once for the whole node, not per camera endpoint.
+        if (CodegenDataModelProvider::Instance().Registry().Get({ kRootEndpointId, TlsCertificateManagement::Id }) == nullptr)
+        {
+            Clusters::AddTlsCertificateManagementEndpoint(kRootEndpointId);
+            Clusters::AddTlsClientManagementEndpoint(kRootEndpointId);
+        }
     }
 
     // Set the WebRTCTransportProvider server in the manager
@@ -403,10 +410,9 @@ void CameraApp::ShutdownCameraDeviceClusters()
         mPushAvStreamTransportServer.Destroy();
     }
 
-    // Tear down the per-endpoint TLS cluster instances (no-ops on the standalone camera-app,
-    // where the fixed-endpoint instances are owned by CodegenIntegration).
-    Clusters::RemoveTlsCertificateManagementEndpoint(mEndpoint);
-    Clusters::RemoveTlsClientManagementEndpoint(mEndpoint);
+    // The TLS clusters are node-wide singletons on the root endpoint, shared by every bridged
+    // camera — deliberately NOT torn down here: removing one camera must not strip the node's
+    // TLS provisioning surface, and at process exit the bridge skips cluster teardown anyway.
 }
 
 static constexpr EndpointId kCameraEndpointId = 1;

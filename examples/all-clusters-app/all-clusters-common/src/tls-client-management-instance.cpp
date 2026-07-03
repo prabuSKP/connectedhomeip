@@ -360,7 +360,10 @@ ClusterStatusCode TlsClientManagementCommandDelegate::ProvisionEndpoint(
 CHIP_ERROR TlsClientManagementCommandDelegate::FindProvisionedEndpointByID(EndpointId matterEndpoint, FabricIndex fabric,
                                                                            uint16_t endpointID, LoadedEndpointCallback callback)
 {
-    VerifyOrReturnError(IsManagedTlsEndpoint(matterEndpoint), CHIP_ERROR_INTERNAL);
+    // Deliberately NOT gated on IsManagedTlsEndpoint: the provisioned-endpoint table is a
+    // node-wide singleton (the TLS clusters live on the root endpoint), and this lookup is
+    // called by Push AV Stream Transport clusters that live on CAMERA endpoints, passing
+    // their own endpoint id.
 
     TlsEndpointId localId(endpointID);
     BufferedEndpoint endpoint;
