@@ -120,14 +120,32 @@ PushAvStreamTransportManager::AllocatePushTransport(const TransportOptionsStruct
     std::vector<uint16_t> videoStreams;
     std::vector<uint16_t> audioStreams;
 
+    // The stream bindings may arrive either as the scalar videoStreamID/audioStreamID fields
+    // (AllocatePushTransport from SmartThings) or only as the videoStreams/audioStreams lists
+    // (ModifyPushTransport, and options persisted after a Modify). Honor both, or a transport
+    // gets registered with no streams and records zero frames.
     if (transportOptions.videoStreamID.HasValue() && !transportOptions.videoStreamID.Value().IsNull())
     {
         videoStreams.push_back(transportOptions.videoStreamID.Value().Value());
+    }
+    else if (transportOptions.videoStreams.HasValue())
+    {
+        for (const auto & stream : transportOptions.videoStreams.Value())
+        {
+            videoStreams.push_back(stream.videoStreamID);
+        }
     }
 
     if (transportOptions.audioStreamID.HasValue() && !transportOptions.audioStreamID.Value().IsNull())
     {
         audioStreams.push_back(transportOptions.audioStreamID.Value().Value());
+    }
+    else if (transportOptions.audioStreams.HasValue())
+    {
+        for (const auto & stream : transportOptions.audioStreams.Value())
+        {
+            audioStreams.push_back(stream.audioStreamID);
+        }
     }
 
     ChipLogProgress(Camera,
@@ -656,25 +674,44 @@ PushAvStreamTransportManager::PersistentAttributesLoadedCallback()
                 // bitRate == 0) and crashes. Resolve them from the currently-allocated streams
                 // first, and skip restoring this transport if a referenced stream is not
                 // (yet) allocated -- the controller re-establishes it at runtime.
-                bool streamsResolved = true;
+                // The stream ID may be in the scalar videoStreamID/audioStreamID fields or only
+                // in the videoStreams/audioStreams lists — options persisted after a
+                // ModifyPushTransport carry only the lists.
+                Optional<uint16_t> videoStreamId;
+                Optional<uint16_t> audioStreamId;
                 if (transportOptionsPtr->videoStreamID.HasValue() && !transportOptionsPtr->videoStreamID.Value().IsNull())
                 {
-                    if (SetVideoStream(transportOptionsPtr->videoStreamID.Value().Value()) !=
-                        Protocols::InteractionModel::Status::Success)
+                    videoStreamId.SetValue(transportOptionsPtr->videoStreamID.Value().Value());
+                }
+                else if (transportOptionsPtr->videoStreams.HasValue() && !transportOptionsPtr->videoStreams.Value().empty())
+                {
+                    videoStreamId.SetValue(transportOptionsPtr->videoStreams.Value().begin()->videoStreamID);
+                }
+                if (transportOptionsPtr->audioStreamID.HasValue() && !transportOptionsPtr->audioStreamID.Value().IsNull())
+                {
+                    audioStreamId.SetValue(transportOptionsPtr->audioStreamID.Value().Value());
+                }
+                else if (transportOptionsPtr->audioStreams.HasValue() && !transportOptionsPtr->audioStreams.Value().empty())
+                {
+                    audioStreamId.SetValue(transportOptionsPtr->audioStreams.Value().begin()->audioStreamID);
+                }
+
+                bool streamsResolved = true;
+                if (videoStreamId.HasValue())
+                {
+                    if (SetVideoStream(videoStreamId.Value()) != Protocols::InteractionModel::Status::Success)
                     {
                         ChipLogError(Zcl, "Skipping restore of connection %u: video stream %u not allocated", connectionID,
-                                     transportOptionsPtr->videoStreamID.Value().Value());
+                                     videoStreamId.Value());
                         streamsResolved = false;
                     }
                 }
-                if (streamsResolved && transportOptionsPtr->audioStreamID.HasValue() &&
-                    !transportOptionsPtr->audioStreamID.Value().IsNull())
+                if (streamsResolved && audioStreamId.HasValue())
                 {
-                    if (SetAudioStream(transportOptionsPtr->audioStreamID.Value().Value()) !=
-                        Protocols::InteractionModel::Status::Success)
+                    if (SetAudioStream(audioStreamId.Value()) != Protocols::InteractionModel::Status::Success)
                     {
                         ChipLogError(Zcl, "Skipping restore of connection %u: audio stream %u not allocated", connectionID,
-                                     transportOptionsPtr->audioStreamID.Value().Value());
+                                     audioStreamId.Value());
                         streamsResolved = false;
                     }
                 }
@@ -689,6 +726,16 @@ PushAvStreamTransportManager::PersistentAttributesLoadedCallback()
                 {
                     ChipLogError(Zcl, "Failed to re-allocate transport for connection ID: %u, status: %u", connectionID,
                                  to_underlying(status));
+                }
+                else if (transportConfig.transportStatus == TransportStatusEnum::kActive)
+                {
+                    // Restore the persisted transport status too. The controller believes the
+                    // status it last set (persisted in CurrentConnections) and will NOT re-send
+                    // SetTransportStatus after our reboot — but a freshly constructed
+                    // PushAVTransport defaults to Inactive, which gates all media flow: triggers
+                    // would "start" a recording that receives zero frames and never uploads.
+                    this->SetTransportStatus({ connectionID }, TransportStatusEnum::kActive);
+                    ChipLogProgress(Zcl, "Restored ACTIVE transport status for connection ID: %u", connectionID);
                 }
             }
             else
