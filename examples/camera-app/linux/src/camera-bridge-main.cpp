@@ -50,6 +50,10 @@
 #include "onvif/resolve_bridge.h"
 // ONVIF WS-Discovery (find cameras on the LAN), so the bridge populates cameras.json itself.
 #include "onvif/wsdiscovery.h"
+// [hikvision] mDNS discovery + direct-RTSP probe: onboard cameras whose ONVIF is disabled
+// (Hikvision default). See docs/HIKVISION_DISCOVERY_PLAN.md.
+#include "onvif/mdnsdisc.h"
+#include "onvif/rtspprobe.h"
 
 #include <AppMain.h>
 #include <Options.h>
@@ -66,6 +70,7 @@
 #include <cctype>
 #include <fstream>
 #include <memory>
+#include <sstream> // MacFromArp: parse /proc/net/arp
 #include <string>
 #include <unistd.h> // _exit
 #include <vector>
@@ -231,6 +236,114 @@ std::string StableCameraId(const std::string & id)
     if (hex.size() != 32)
         return id;
     return "onvif-mac-" + hex.substr(20); // last 12 hex = MAC / UUID node
+}
+
+// [hikvision] Derive the MAC-based stable id for an mDNS-discovered camera from the kernel
+// ARP table. mDNS carries no ONVIF URN, but any camera we just probed over TCP is in
+// /proc/net/arp, and its MAC yields the SAME "onvif-mac-<12hex>" that StableCameraId() derives
+// from a WS-Discovery UUID — so a camera seen by both paths dedups to one bridged device.
+// Returns "" if the IP has no complete ARP entry (caller falls back to the mDNS serial).
+std::string MacFromArp(const std::string & ip)
+{
+    std::ifstream f("/proc/net/arp");
+    if (!f.is_open())
+        return {};
+    std::string line;
+    std::getline(f, line); // skip header row
+    while (std::getline(f, line))
+    {
+        std::istringstream ss(line);
+        std::string colIp, hwType, flags, hwAddr;
+        if (!(ss >> colIp >> hwType >> flags >> hwAddr))
+            continue;
+        if (colIp != ip)
+            continue;
+        if (flags != "0x2") // 0x2 = ATF_COM (resolved/complete); skip incomplete entries
+            return {};
+        std::string hex;
+        for (char c : hwAddr)
+            if (c != ':')
+                hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (hex.size() != 12 || hex == "000000000000")
+            return {};
+        return "onvif-mac-" + hex;
+    }
+    return {};
+}
+
+// Extract the host (IP or name) from an http(s)/rtsp URL: "http://1.2.3.4/onvif/..." -> "1.2.3.4".
+std::string HostFromUrl(const std::string & url)
+{
+    size_t start = url.find("://");
+    start        = (start == std::string::npos) ? 0 : start + 3;
+    size_t at    = url.find('@', start);
+    if (at != std::string::npos)
+        start = at + 1;
+    size_t end = start;
+    while (end < url.size() && url[end] != ':' && url[end] != '/')
+        ++end;
+    return url.substr(start, end - start);
+}
+
+// [hikvision] Onboard a camera by a directly-formed Hikvision RTSP URL (used when ONVIF is
+// disabled). Probes the main stream (H.264 required); an H.265 main stream falls back to the
+// substream (commonly H.264). Fills `entry` (mode="direct", no ptz/snapshot/token) and
+// `codecOut` on success. LOCKOUT-CRITICAL: onvif_rtsp_probe makes at most one authenticated
+// attempt per stream, so this issues at most two logins (main + sub) and never retries.
+// Returns RTSP_PROBE_OK on success, else the probe's failure code (AUTH / UNREACHABLE / NO_H264).
+int TryDirectRtsp(const std::string & ip, const std::string & name, const std::string & user,
+                  const std::string & pass, const std::string & dni,
+                  CameraConfig::CameraEntry & entry, std::string & codecOut)
+{
+    const std::string mainUrl = "rtsp://" + ip + ":554/Streaming/Channels/101";
+    const std::string subUrl  = "rtsp://" + ip + ":554/Streaming/Channels/102";
+
+    rtsp_probe_result_t res;
+    int rc = onvif_rtsp_probe(mainUrl.c_str(), user.c_str(), pass.c_str(), /*timeout=*/5, &res);
+    std::string chosenUrl  = mainUrl;
+    std::string streamKind = "mainstream";
+    codecOut               = res.codec;
+
+    // Main stream is H.265 (our pipeline is H.264-only) — try the substream.
+    if (rc == RTSP_PROBE_NO_H264 && std::string(res.codec) == "H265")
+    {
+        ChipLogProgress(Camera, "CameraBridge: %s main stream is H.265 — trying substream", ip.c_str());
+        rtsp_probe_result_t subRes;
+        int subRc = onvif_rtsp_probe(subUrl.c_str(), user.c_str(), pass.c_str(), 5, &subRes);
+        if (subRc == RTSP_PROBE_OK)
+        {
+            rc         = subRc;
+            chosenUrl  = subUrl;
+            streamKind = "substream";
+            codecOut   = subRes.codec;
+        }
+    }
+
+    if (rc != RTSP_PROBE_OK)
+    {
+        const char * why = rc == RTSP_PROBE_AUTH          ? "auth_failed (check default credentials)"
+            : rc == RTSP_PROBE_UNREACHABLE                ? "unreachable"
+            : rc == RTSP_PROBE_NO_H264                    ? "h265_only — set the camera's video encoding to H.264"
+                                                          : "probe_failed";
+        ChipLogProgress(Camera, "CameraBridge: direct-RTSP onboarding of '%s' (%s) skipped: %s", name.c_str(),
+                        ip.c_str(), why);
+        return rc;
+    }
+
+    entry.name   = name.empty() ? std::string("ONVIF Camera") : name;
+    entry.dni    = dni;
+    entry.controlUrl.clear(); // no ONVIF control URL in direct mode
+    entry.stream = streamKind;
+    entry.mode   = "direct";
+    entry.onvif.rtspUrl = chosenUrl;
+    entry.onvif.ptzUrl.clear();
+    entry.onvif.snapshotUrl.clear();
+    entry.onvif.token.clear();
+    entry.onvif.user = user;
+    entry.onvif.pass = pass;
+    ChipLogProgress(Camera, "CameraBridge: direct-RTSP onboarded '%s' (%s) rtsp=%s codec=%s", entry.name.c_str(),
+                    dni.c_str(), chosenUrl.c_str(), codecOut.c_str());
+    return RTSP_PROBE_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +517,55 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     int rc       = onvif_resolve_bridge(req.controlUrl.c_str(), req.userid.c_str(), req.password.c_str(), wantMain, &res);
     if (rc != ONVIF_BRIDGE_OK)
     {
+        // [hikvision] ONVIF failed for a non-auth reason (unreachable / no ONVIF streams /
+        // parse error — all consistent with ONVIF being DISABLED on a modern Hikvision that
+        // still serves RTSP). Fall back to a directly-formed RTSP URL so the Edge driver's
+        // manual add-by-IP works for such cameras with no driver/protocol change. We do NOT
+        // fall back on ONVIF auth failure: that means the creds are wrong, so an RTSP probe with
+        // the same creds would only burn the camera's login-lock budget (A5). The probe itself
+        // makes a single authenticated attempt.
+        if (rc != ONVIF_BRIDGE_AUTH)
+        {
+            std::string host = HostFromUrl(req.controlUrl);
+            std::string sid  = !req.dni.empty() ? StableCameraId(req.dni) : MacFromArp(host);
+            if (sid.empty())
+                sid = std::string("hik-ip-") + host;
+            CameraConfig::CameraEntry entry;
+            std::string codec;
+            int prc = TryDirectRtsp(host, req.name, req.userid, req.password, sid, entry, codec);
+            if (prc == RTSP_PROBE_OK)
+            {
+                RemoveCameraByDni(sid); // idempotent re-onboard
+                int endpoint = AddCamera(entry);
+                if (endpoint < 0)
+                {
+                    out.status = "internal_error";
+                    out.error  = "failed to create camera endpoint";
+                    return out;
+                }
+                PersistCameras();
+                out.ok         = true;
+                out.status     = "onboarded";
+                out.endpoint   = endpoint;
+                out.videoCodec = codec;
+                ChipLogProgress(Camera, "CameraBridge: upsert dni=%s onboarded (direct-RTSP) on endpoint %d",
+                                req.dni.c_str(), endpoint);
+                return out;
+            }
+            if (prc == RTSP_PROBE_AUTH)
+            {
+                out.status = "auth_failed";
+                out.error  = "RTSP auth failed (direct mode)";
+                return out;
+            }
+            if (prc == RTSP_PROBE_NO_H264)
+            {
+                out.status = "no_streams";
+                out.error  = "no H.264 stream (set the camera's video encoding to H.264)";
+                return out;
+            }
+            // still unreachable — fall through to the standard error mapping
+        }
         switch (rc)
         {
         case ONVIF_BRIDGE_AUTH:        out.status = "auth_failed"; break;
@@ -425,6 +587,7 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.dni           = sid;
     entry.controlUrl    = req.controlUrl;
     entry.stream        = req.stream.empty() ? std::string("mainstream") : req.stream;
+    entry.mode          = "onvif";
     entry.onvif.rtspUrl     = res.rtsp_url;
     entry.onvif.ptzUrl      = res.ptz_url;
     entry.onvif.snapshotUrl = res.snapshot_url;
@@ -635,6 +798,105 @@ void ApplicationInit()
     }
 
     // ------------------------------------------------------------------
+    // [hikvision] mDNS discovery FIRST (user priority): modern Hikvision cameras ship ONVIF
+    // (hence WS-Discovery) DISABLED by default but Bonjour ON, so the WS-Discovery pass below
+    // is blind to them. Per mDNS device: try ONVIF resolve anyway (in case the user enabled it
+    // — that yields PTZ/snapshot for free); otherwise onboard via a directly-formed RTSP URL
+    // (direct mode). See docs/HIKVISION_DISCOVERY_PLAN.md.
+    // ------------------------------------------------------------------
+    {
+        mdns_found_t found[16];
+        int nf = onvif_mdns_discover(found, 16, /*wait_secs=*/4);
+        ChipLogProgress(Camera, "CameraBridge: mDNS found %d Hikvision camera(s) on the LAN", nf);
+        for (int i = 0; i < nf; ++i)
+        {
+            std::string ip = found[i].ip;
+
+            // Stable identity: prefer the ARP-derived MAC (matches the WS-D UUID-node scheme so
+            // a camera seen by both paths dedups); fall back to the mDNS serial.
+            std::string sid = MacFromArp(ip);
+            if (sid.empty())
+                sid = std::string("hik-serial-") + found[i].serial;
+
+            // Already known by stable id? For a direct camera, rebuild its RTSP URL in place on
+            // a DHCP IP change (the mirror of the WS-D control-URL update below).
+            CameraConfig::CameraEntry * match = nullptr;
+            for (auto & e : cameraList)
+                if (StableCameraId(e.dni) == StableCameraId(sid))
+                {
+                    match = &e;
+                    break;
+                }
+            if (match != nullptr)
+            {
+                if (match->mode == "direct")
+                {
+                    std::string newUrl = "rtsp://" + ip + ":554/Streaming/Channels/" +
+                        (match->stream == "substream" ? "102" : "101");
+                    if (match->onvif.rtspUrl != newUrl)
+                    {
+                        ChipLogProgress(Camera, "CameraBridge: direct camera %s IP changed -> %s (rtsp updated in place)",
+                                        sid.c_str(), ip.c_str());
+                        match->onvif.rtspUrl = newUrl;
+                    }
+                }
+                continue;
+            }
+
+            // Tier 1 (A1): ONVIF resolve — works only if the user enabled ONVIF. For an
+            // ONVIF-disabled camera the /onvif/device_service endpoint isn't served, so this
+            // fails on the HTTP layer WITHOUT a login attempt (no lockout risk).
+            std::string controlUrl = "http://" + ip + "/onvif/device_service";
+            std::string cu = gDefaultUser, cp = gDefaultPass;
+            onvif_resolved_bridge_t res;
+            int drc = onvif_resolve_bridge(controlUrl.c_str(), cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+            if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+            {
+                drc = onvif_resolve_bridge(controlUrl.c_str(), "", "", 1, &res);
+                if (drc == ONVIF_BRIDGE_OK)
+                {
+                    cu.clear();
+                    cp.clear();
+                }
+            }
+            if (drc == ONVIF_BRIDGE_OK)
+            {
+                CameraConfig::CameraEntry e;
+                e.name       = found[i].name[0] ? found[i].name : "ONVIF Camera";
+                e.dni        = sid;
+                e.controlUrl = controlUrl;
+                e.stream     = "mainstream";
+                e.mode       = "onvif";
+                e.onvif.rtspUrl     = res.rtsp_url;
+                e.onvif.ptzUrl      = res.ptz_url;
+                e.onvif.snapshotUrl = res.snapshot_url;
+                e.onvif.token       = res.token;
+                e.onvif.user        = cu;
+                e.onvif.pass        = cp;
+                ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
+                                e.dni.c_str(), e.onvif.rtspUrl.c_str());
+                cameraList.push_back(std::move(e));
+                continue;
+            }
+
+            // If ONVIF explicitly rejected the creds, the same creds will fail RTSP too — skip
+            // direct mode so we don't burn the camera's login-lock budget (A5).
+            if (drc == ONVIF_BRIDGE_AUTH)
+            {
+                ChipLogProgress(Camera, "CameraBridge: mDNS camera %s ONVIF auth failed — skipping (fix default creds)",
+                                sid.c_str());
+                continue;
+            }
+
+            // Tier 2 (A1/A5): directly-formed RTSP with the default login (single auth attempt).
+            CameraConfig::CameraEntry e;
+            std::string codec;
+            if (TryDirectRtsp(ip, found[i].name, gDefaultUser, gDefaultPass, sid, e, codec) == RTSP_PROBE_OK)
+                cameraList.push_back(std::move(e));
+        }
+    }
+
+    // ------------------------------------------------------------------
     // [single_bridge] WS-Discovery: find ONVIF cameras on the LAN ourselves and add any
     // not already in the list, resolved with the default ONVIF login (falling back to
     // anonymous). Together with the PersistCameras() below, the bridge populates
@@ -719,6 +981,7 @@ void ApplicationInit()
             e.dni           = sid;
             e.controlUrl    = found[i].control_url;
             e.stream        = "mainstream";
+            e.mode          = "onvif";
             e.onvif.rtspUrl     = res.rtsp_url;
             e.onvif.ptzUrl      = res.ptz_url;
             e.onvif.snapshotUrl = res.snapshot_url;

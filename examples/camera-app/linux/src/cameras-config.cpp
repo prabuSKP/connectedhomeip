@@ -253,6 +253,9 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
         entry.dni          = ExtractField(obj, "dni");
         entry.controlUrl   = ExtractField(obj, "control_url");
         entry.stream       = ExtractField(obj, "stream");
+        entry.mode         = ExtractField(obj, "mode");
+        if (entry.mode.empty())
+            entry.mode = "onvif"; // absent in older files → ONVIF-resolved camera
         entry.onvif.rtspUrl     = ExtractField(obj, "rtsp");
         entry.onvif.ptzUrl      = ExtractField(obj, "ptz");
         entry.onvif.snapshotUrl = ExtractField(obj, "snapshot");
@@ -306,6 +309,7 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
         const auto & c        = cameras[i];
         std::string src       = c.onvif.useTestSrc ? "test" : c.onvif.rtspUrl;
         std::string streamVal = c.stream.empty() ? "mainstream" : c.stream;
+        std::string modeVal   = c.mode.empty() ? "onvif" : c.mode;
         file << "  { \"name\": \"" << JsonEscape(c.name) << "\""
              << ", \"dni\": \"" << JsonEscape(c.dni) << "\""
              << ", \"rtsp\": \"" << JsonEscape(src) << "\""
@@ -315,7 +319,8 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
              << ", \"user\": \"" << JsonEscape(c.onvif.user) << "\""
              << ", \"pass\": \"" << JsonEscape(c.onvif.pass) << "\""
              << ", \"control_url\": \"" << JsonEscape(c.controlUrl) << "\""
-             << ", \"stream\": \"" << JsonEscape(streamVal) << "\" }"
+             << ", \"stream\": \"" << JsonEscape(streamVal) << "\""
+             << ", \"mode\": \"" << JsonEscape(modeVal) << "\" }"
              << (i + 1 < cameras.size() ? "," : "") << "\n";
     }
     file << "]\n";

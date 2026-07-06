@@ -646,6 +646,12 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
 
         // rtspsrc: cap the jitterbuffer latency; let it negotiate transport (UDP→TCP fallback).
         g_object_set(source, "location", onvifUrl.c_str(), "latency", 200, nullptr);
+        // Credentials go to rtspsrc as element properties (user-id/user-pw), NOT embedded in the
+        // location URL — the URL is logged and persisted, so a "user:pass@" prefix would leak the
+        // password. rtspsrc answers the camera's Digest/Basic challenge itself. Required for
+        // cameras that enforce RTSP auth (e.g. all Hikvision), harmless for those that don't.
+        if (!mOnvifConfig.user.empty())
+            g_object_set(source, "user-id", mOnvifConfig.user.c_str(), "user-pw", mOnvifConfig.pass.c_str(), nullptr);
         // h264parse: emit byte-stream access units and repeat SPS/PPS (config-interval=-1) so a
         // mid-stream WebRTC viewer can start decoding immediately.
         g_object_set(parse, "config-interval", -1, nullptr);
@@ -1058,7 +1064,8 @@ bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
 // Fallback snapshot: pull one H.264 keyframe from RTSP with a short-lived GStreamer pipeline
 // (independent of the live-view path), decode it with libav, and MJPEG-encode to `path`.
 // The hub ships no jpegenc/decoder GStreamer plugins, so decode+encode is done via libav.
-bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & path, int timeoutSec)
+bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & user, const std::string & pass,
+                     const std::string & path, int timeoutSec)
 {
     if (rtspUrl.empty())
         return false;
@@ -1082,6 +1089,18 @@ bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & path, int 
     {
         gst_object_unref(pipeline);
         return false;
+    }
+
+    // Credentials as rtspsrc properties (not in the launch-string URL, which is built from
+    // untrusted config and would leak the password if logged). See the live pipeline above.
+    if (!user.empty())
+    {
+        GstElement * src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+        if (src)
+        {
+            g_object_set(src, "user-id", user.c_str(), "user-pw", pass.c_str(), nullptr);
+            gst_object_unref(src);
+        }
     }
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -1225,7 +1244,7 @@ bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & 
     }
     // Idle + stale (nobody streaming, cache old/empty): grab a FRESH frame with a short dedicated RTSP
     // session. Safe from contention because nothing else is using the camera right now.
-    if (!liveActive && SnapshotViaRtsp(cfg.rtspUrl, path, /*timeoutSec=*/3))
+    if (!liveActive && SnapshotViaRtsp(cfg.rtspUrl, cfg.user, cfg.pass, path, /*timeoutSec=*/3))
     {
         ChipLogProgress(Camera, "Snapshot: refreshed via dedicated RTSP keyframe -> %s", path.c_str());
         return true;

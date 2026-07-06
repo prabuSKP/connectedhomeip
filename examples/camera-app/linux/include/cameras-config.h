@@ -34,8 +34,12 @@ struct CameraEntry
 {
     std::string name;       // Display name (BridgedDeviceBasicInformation.NodeLabel)
     std::string dni;        // Stable join key from WS-Discovery; also the Bridged uniqueId
-    std::string controlUrl; // ONVIF device-service URL (source; kept for re-resolve)
+    std::string controlUrl; // ONVIF device-service URL (source; kept for re-resolve).
+                            // Empty for direct-RTSP cameras (mode=="direct").
     std::string stream;     // "mainstream" | "substream" (default mainstream)
+    std::string mode;       // "onvif" (default/absent) | "direct". Direct = Hikvision-style
+                            // camera with ONVIF disabled: rtsp URL formed from the IP, no
+                            // control_url, no re-resolve (see HIKVISION_DISCOVERY_PLAN.md).
     Camera::OnvifConfig onvif; // resolved rtsp/ptz/token + user/pass + useTestSrc
 };
 
