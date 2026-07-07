@@ -286,51 +286,79 @@ std::string HostFromUrl(const std::string & url)
 }
 
 // [hikvision] Onboard a camera by a directly-formed Hikvision RTSP URL (used when ONVIF is
-// disabled). Probes the main stream (H.264 required); an H.265 main stream falls back to the
-// substream (commonly H.264). Fills `entry` (mode="direct", no ptz/snapshot/token) and
-// `codecOut` on success. LOCKOUT-CRITICAL: onvif_rtsp_probe makes at most one authenticated
-// attempt per stream, so this issues at most two logins (main + sub) and never retries.
-// Returns RTSP_PROBE_OK on success, else the probe's failure code (AUTH / UNREACHABLE / NO_H264).
+// disabled). Probes the modern scheme's main stream (H.264 required); an H.265 main stream
+// falls back to the substream (commonly H.264); a 404 on the modern scheme falls back to the
+// legacy pre-V5 path scheme (/h264/ch1/...). Fills `entry` (mode="direct", no
+// ptz/snapshot/token) and `codecOut` on success. LOCKOUT-CRITICAL: at most ONE FAILED login
+// per camera per boot — a rejected password (AUTH) aborts the whole chain immediately;
+// substream/legacy probes only run after a success or a wrong-PATH 404, neither of which
+// costs illegal-login-lock strikes.
+// Returns RTSP_PROBE_OK on success, else the probe's failure code
+// (AUTH / UNREACHABLE / NO_H264 / BAD_PATH).
 int TryDirectRtsp(const std::string & ip, const std::string & name, const std::string & user,
                   const std::string & pass, const std::string & dni,
                   CameraConfig::CameraEntry & entry, std::string & codecOut)
 {
-    const std::string mainUrl = "rtsp://" + ip + ":554/Streaming/Channels/101";
-    const std::string subUrl  = "rtsp://" + ip + ":554/Streaming/Channels/102";
+    std::string chosenUrl;
+    std::string streamKind;
 
-    rtsp_probe_result_t res;
-    int rc = onvif_rtsp_probe(mainUrl.c_str(), user.c_str(), pass.c_str(), /*timeout=*/5, &res);
-    std::string chosenUrl  = mainUrl;
-    std::string streamKind = "mainstream";
-    codecOut               = res.codec;
-
-    // Main stream is H.265 (our pipeline is H.264-only) — try the substream.
-    if (rc == RTSP_PROBE_NO_H264 && std::string(res.codec) == "H265")
-    {
-        ChipLogProgress(Camera, "CameraBridge: %s main stream is H.265 — trying substream", ip.c_str());
-        rtsp_probe_result_t subRes;
-        int subRc = onvif_rtsp_probe(subUrl.c_str(), user.c_str(), pass.c_str(), 5, &subRes);
-        if (subRc == RTSP_PROBE_OK)
+    // Probe a main/sub URL pair: main first; if main is H.265 (our pipeline is
+    // H.264-only passthrough) try the substream, which is commonly H.264.
+    auto probePair = [&](const std::string & mainUrl, const std::string & subUrl) -> int {
+        rtsp_probe_result_t res;
+        int rc     = onvif_rtsp_probe(mainUrl.c_str(), user.c_str(), pass.c_str(), /*timeout=*/5, &res);
+        chosenUrl  = mainUrl;
+        streamKind = "mainstream";
+        codecOut   = res.codec;
+        if (rc == RTSP_PROBE_NO_H264 && std::string(res.codec) == "H265")
         {
-            rc         = subRc;
-            chosenUrl  = subUrl;
-            streamKind = "substream";
-            codecOut   = subRes.codec;
+            ChipLogProgress(Camera, "CameraBridge: %s main stream is H.265 — trying substream", ip.c_str());
+            rtsp_probe_result_t subRes;
+            int subRc = onvif_rtsp_probe(subUrl.c_str(), user.c_str(), pass.c_str(), 5, &subRes);
+            if (subRc == RTSP_PROBE_OK)
+            {
+                chosenUrl  = subUrl;
+                streamKind = "substream";
+                codecOut   = subRes.codec;
+                return subRc;
+            }
         }
+        return rc;
+    };
+
+    // Modern scheme first (firmware >= V5.0 — everything that also speaks mDNS).
+    int rc = probePair("rtsp://" + ip + ":554/Streaming/Channels/101",
+                       "rtsp://" + ip + ":554/Streaming/Channels/102");
+
+    // 404 on the modern path: pre-V5 firmware serves the legacy scheme instead.
+    // A wrong PATH costs no login-lock strikes (only a rejected password does),
+    // so this second scheme stays within the one-failed-login budget (A5) —
+    // an AUTH result above never reaches here.
+    if (rc == RTSP_PROBE_BAD_PATH)
+    {
+        ChipLogProgress(Camera, "CameraBridge: %s modern RTSP path not found (404) — trying legacy /h264/ch1 scheme",
+                        ip.c_str());
+        rc = probePair("rtsp://" + ip + ":554/h264/ch1/main/av_stream",
+                       "rtsp://" + ip + ":554/h264/ch1/sub/av_stream");
     }
 
     if (rc != RTSP_PROBE_OK)
     {
+        // NO_H264 covers two distinct probe outcomes, told apart by the codec field:
+        // "H265" = a stream exists but is H.265; "" = the camera returned no video stream at all.
         const char * why = rc == RTSP_PROBE_AUTH          ? "auth_failed (check default credentials)"
             : rc == RTSP_PROBE_UNREACHABLE                ? "unreachable"
-            : rc == RTSP_PROBE_NO_H264                    ? "h265_only — set the camera's video encoding to H.264"
+            : rc == RTSP_PROBE_BAD_PATH                   ? "bad_path (no known Hikvision RTSP scheme answered)"
+            : rc == RTSP_PROBE_NO_H264 && codecOut == "H265"
+                                                          ? "h265_only — set the camera's video encoding to H.264"
+            : rc == RTSP_PROBE_NO_H264                    ? "no_video_stream"
                                                           : "probe_failed";
         ChipLogProgress(Camera, "CameraBridge: direct-RTSP onboarding of '%s' (%s) skipped: %s", name.c_str(),
                         ip.c_str(), why);
         return rc;
     }
 
-    entry.name   = name.empty() ? std::string("ONVIF Camera") : name;
+    entry.name   = name.empty() ? std::string("Hikvision Camera") : name; // non-ONVIF direct camera
     entry.dni    = dni;
     entry.controlUrl.clear(); // no ONVIF control URL in direct mode
     entry.stream = streamKind;
@@ -562,6 +590,15 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
             {
                 out.status = "no_streams";
                 out.error  = "no H.264 stream (set the camera's video encoding to H.264)";
+                return out;
+            }
+            if (prc == RTSP_PROBE_BAD_PATH)
+            {
+                // Both the modern and legacy Hikvision RTSP schemes got a 404. Keep the
+                // protocol's status vocabulary ("unreachable"); the error text carries the
+                // truth so nobody chases a credentials problem that does not exist.
+                out.status = "unreachable";
+                out.error  = "RTSP path not found (tried /Streaming/Channels/101 and legacy /h264/ch1)";
                 return out;
             }
             // still unreachable — fall through to the standard error mapping
@@ -812,23 +849,31 @@ void ApplicationInit()
         {
             std::string ip = found[i].ip;
 
-            // Stable identity: prefer the ARP-derived MAC (matches the WS-D UUID-node scheme so
-            // a camera seen by both paths dedups); fall back to the mDNS serial.
-            std::string sid = MacFromArp(ip);
-            if (sid.empty())
-                sid = std::string("hik-serial-") + found[i].serial;
+            // Two-stage identity (A3, G1/G2). ARP is only guaranteed complete AFTER a TCP
+            // contact with the camera, so the authoritative MAC id is read post-contact in
+            // stage B below. Stage A (here) decides "already known?" WITHOUT contacting the
+            // camera — no login attempt is ever spent on a known camera (A5) — by matching
+            // opportunistic ARP (often warm from the mDNS reply itself), the entry's host IP,
+            // and the serial-fallback id, so entries persisted under EITHER id form
+            // (onvif-mac-… or hik-serial-…) are recognized (G1).
+            std::string arpSid    = MacFromArp(ip); // opportunistic — may be "" pre-contact
+            std::string serialSid = found[i].serial[0] ? std::string("hik-serial-") + found[i].serial : std::string();
 
-            // Already known by stable id? For a direct camera, rebuild its RTSP URL in place on
-            // a DHCP IP change (the mirror of the WS-D control-URL update below).
             CameraConfig::CameraEntry * match = nullptr;
             for (auto & e : cameraList)
-                if (StableCameraId(e.dni) == StableCameraId(sid))
+            {
+                std::string esid = StableCameraId(e.dni);
+                if ((!arpSid.empty() && esid == arpSid) || (!serialSid.empty() && esid == serialSid) ||
+                    HostFromUrl(e.controlUrl) == ip || HostFromUrl(e.onvif.rtspUrl) == ip)
                 {
                     match = &e;
                     break;
                 }
+            }
             if (match != nullptr)
             {
+                // Already known. For a direct camera, rebuild its RTSP URL in place on a DHCP
+                // IP change (the mirror of the WS-D control-URL update below).
                 if (match->mode == "direct")
                 {
                     std::string newUrl = "rtsp://" + ip + ":554/Streaming/Channels/" +
@@ -836,12 +881,39 @@ void ApplicationInit()
                     if (match->onvif.rtspUrl != newUrl)
                     {
                         ChipLogProgress(Camera, "CameraBridge: direct camera %s IP changed -> %s (rtsp updated in place)",
-                                        sid.c_str(), ip.c_str());
+                                        match->dni.c_str(), ip.c_str());
                         match->onvif.rtspUrl = newUrl;
                     }
                 }
                 continue;
             }
+
+            // Stage B helpers, used only after a SUCCESSFUL resolve/probe (i.e. a completed TCP
+            // handshake, which guarantees a complete 0x2 ARP entry — A3/G2). The serial fallback
+            // should be near-impossible past that point.
+            auto authoritativeSid = [&ip, &found, i]() {
+                std::string s = MacFromArp(ip);
+                return s.empty() ? std::string("hik-serial-") + found[i].serial : s;
+            };
+            // Final dedup (G1): stage A can miss when ARP was cold and the camera is persisted
+            // under onvif-mac-… with a since-changed IP (e.g. onboarded via WS-D on an earlier
+            // boot). Now that the id is authoritative, fold the fresh resolve into the existing
+            // entry in place instead of appending a duplicate bridged camera.
+            auto mergeOrAppend = [&cameraList](CameraConfig::CameraEntry && e) {
+                for (auto & known : cameraList)
+                    if (StableCameraId(known.dni) == StableCameraId(e.dni))
+                    {
+                        ChipLogProgress(Camera,
+                                        "CameraBridge: mDNS camera %s already known under its authoritative id (updated in place)",
+                                        e.dni.c_str());
+                        known.controlUrl = e.controlUrl;
+                        known.stream     = e.stream;
+                        known.mode       = e.mode;
+                        known.onvif      = e.onvif;
+                        return;
+                    }
+                cameraList.push_back(std::move(e));
+            };
 
             // Tier 1 (A1): ONVIF resolve — works only if the user enabled ONVIF. For an
             // ONVIF-disabled camera the /onvif/device_service endpoint isn't served, so this
@@ -861,9 +933,11 @@ void ApplicationInit()
             }
             if (drc == ONVIF_BRIDGE_OK)
             {
+                // Stage B (A3/G2): the resolve's TCP contact just completed — read ARP NOW for
+                // the authoritative MAC id, not the possibly-cold pre-contact one.
                 CameraConfig::CameraEntry e;
                 e.name       = found[i].name[0] ? found[i].name : "ONVIF Camera";
-                e.dni        = sid;
+                e.dni        = authoritativeSid();
                 e.controlUrl = controlUrl;
                 e.stream     = "mainstream";
                 e.mode       = "onvif";
@@ -875,7 +949,7 @@ void ApplicationInit()
                 e.onvif.pass        = cp;
                 ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
                                 e.dni.c_str(), e.onvif.rtspUrl.c_str());
-                cameraList.push_back(std::move(e));
+                mergeOrAppend(std::move(e));
                 continue;
             }
 
@@ -884,15 +958,24 @@ void ApplicationInit()
             if (drc == ONVIF_BRIDGE_AUTH)
             {
                 ChipLogProgress(Camera, "CameraBridge: mDNS camera %s ONVIF auth failed — skipping (fix default creds)",
-                                sid.c_str());
+                                ip.c_str());
                 continue;
             }
 
             // Tier 2 (A1/A5): directly-formed RTSP with the default login (single auth attempt).
+            // The pre-contact id passed here is provisional (for the probe's own log line);
+            // stage B overwrites it with the post-contact authoritative id on success.
             CameraConfig::CameraEntry e;
             std::string codec;
-            if (TryDirectRtsp(ip, found[i].name, gDefaultUser, gDefaultPass, sid, e, codec) == RTSP_PROBE_OK)
-                cameraList.push_back(std::move(e));
+            if (TryDirectRtsp(ip, found[i].name, gDefaultUser, gDefaultPass,
+                              arpSid.empty() ? std::string("hik-serial-") + found[i].serial : arpSid, e,
+                              codec) == RTSP_PROBE_OK)
+            {
+                // Stage B (A3/G2): the probe's TCP contact just completed — re-read ARP for the
+                // authoritative MAC id.
+                e.dni = authoritativeSid();
+                mergeOrAppend(std::move(e));
+            }
         }
     }
 
@@ -913,9 +996,14 @@ void ApplicationInit()
             std::string sid = StableCameraId(found[i].urn);
 
             // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
+            // [hikvision] Also crosscheck by host IP (G1): the mDNS pass above may have keyed
+            // this same camera hik-serial-… (ARP fallback) while its WS-D URN yields
+            // onvif-mac-… — the shared IP is what ties the two views to one physical device.
+            std::string wsdHost = HostFromUrl(found[i].control_url);
             CameraConfig::CameraEntry * match = nullptr;
             for (auto & e : cameraList)
-                if (StableCameraId(e.dni) == sid)
+                if (StableCameraId(e.dni) == sid ||
+                    (!wsdHost.empty() && (HostFromUrl(e.controlUrl) == wsdHost || HostFromUrl(e.onvif.rtspUrl) == wsdHost)))
                 {
                     match = &e;
                     break;
