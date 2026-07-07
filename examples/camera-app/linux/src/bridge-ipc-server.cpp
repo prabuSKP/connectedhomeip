@@ -122,6 +122,16 @@ std::string RemoveResponse(const std::string & id)
     return "{\"v\":1,\"id\":\"" + Escape(id) + "\",\"ok\":true,\"status\":\"removed\"}";
 }
 
+// `discover` reports the scan counts: how many ONVIF responders answered (`found`),
+// how many NEW cameras were onboarded (`added`), and the total now bridged
+// (`cameras`, carried in OpResult::endpoint like set_default_creds does).
+std::string DiscoverResponse(const std::string & id, const OpResult & r)
+{
+    return "{\"v\":1,\"id\":\"" + Escape(id) + "\",\"ok\":true,\"status\":\"ok\",\"result\":{\"found\":" +
+        std::to_string(r.found) + ",\"added\":" + std::to_string(r.added) + ",\"cameras\":" +
+        std::to_string(r.endpoint) + "}}";
+}
+
 // ---- request handling --------------------------------------------------------
 
 // Read one '\n'-terminated line (byte-at-a-time; requests are tiny). Trailing
@@ -211,6 +221,18 @@ std::string Dispatch(const std::string & req)
         if (r.ok)
             return "{\"v\":1,\"id\":\"" + Escape(id) + "\",\"ok\":true,\"status\":\"" + Escape(r.status) +
                 "\",\"result\":{\"cameras\":" + std::to_string(r.endpoint) + "}}";
+        return FailResponse(hasId, id, r.status.empty() ? "internal_error" : r.status, r.error);
+    }
+
+    if (op == "discover")
+    {
+        // Runtime LAN rescan (pull-to-refresh): trigger native WS-Discovery, onboard
+        // newly-found cameras and update moved ones — the same work done once at boot.
+        // No params: it uses the stored default creds (with anonymous fallback). This
+        // blocks for a few seconds on the UDP multicast wait + per-camera SOAP resolve.
+        OpResult r = gCallbacks.discover ? gCallbacks.discover() : OpResult{};
+        if (r.ok)
+            return DiscoverResponse(id, r);
         return FailResponse(hasId, id, r.status.empty() ? "internal_error" : r.status, r.error);
     }
 

@@ -62,6 +62,10 @@ struct OpResult
     std::string videoCodec;
     bool hasPtz       = false;
     bool hasAudioOut  = false;
+    // discover success payload (`endpoint` doubles as the total bridged-camera
+    // count here, mirroring how set_default_creds reports `result.cameras`):
+    int found = 0; // ONVIF responders returned by this WS-Discovery scan
+    int added = 0; // NEW cameras onboarded (bridged endpoints created) this scan
 };
 
 struct Callbacks
@@ -71,6 +75,9 @@ struct Callbacks
     std::function<size_t()> count; // current camera count, for `ping`
     // [single_bridge] set one default ONVIF login applied to every camera.
     std::function<OpResult(const std::string & userid, const std::string & password)> setDefaultCreds;
+    // [single_bridge] runtime LAN rescan: native WS-Discovery, onboard new cameras,
+    // update moved ones. No params — uses the stored default creds (anonymous fallback).
+    std::function<OpResult()> discover;
 };
 
 // Start the accept loop on 0.0.0.0:<port> in a background thread.

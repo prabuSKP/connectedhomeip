@@ -392,6 +392,170 @@ void PersistCameras()
 }
 
 // ---------------------------------------------------------------------------
+// WS-Discovery (native, boot + on-demand IPC `discover`)
+// ---------------------------------------------------------------------------
+
+// Resolve a freshly-discovered camera with the bridge default ONVIF login, falling
+// back to anonymous if the default creds are rejected. On success fills a complete
+// CameraEntry and returns true; returns false if the camera needs credentials we
+// don't have (caller skips it). BLOCKING SOAP — never call under StackLock.
+bool ResolveDiscoveredCamera(const onvif_discovered_t & d, const std::string & sid, CameraConfig::CameraEntry & e)
+{
+    onvif_resolved_bridge_t res;
+    std::string cu = gDefaultUser, cp = gDefaultPass;
+    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+    {
+        cu.clear(); // default creds rejected — fall back to anonymous
+        cp.clear();
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+    }
+    if (drc != ONVIF_BRIDGE_OK)
+        return false;
+
+    e.name          = d.name[0] ? d.name : "ONVIF Camera";
+    e.dni           = sid;
+    e.controlUrl    = d.control_url;
+    e.stream        = "mainstream";
+    e.onvif.rtspUrl     = res.rtsp_url;
+    e.onvif.ptzUrl      = res.ptz_url;
+    e.onvif.snapshotUrl = res.snapshot_url;
+    e.onvif.token       = res.token;
+    e.onvif.user        = cu;
+    e.onvif.pass        = cp;
+    return true;
+}
+
+// A known camera's control URL (DHCP IP) changed. Re-resolve it — its own creds
+// first, then the bridge default, then anonymous — and update `entry` IN PLACE so a
+// reconnect doesn't spawn a duplicate. Returns true if re-resolved (entry updated),
+// false to keep the previous config. BLOCKING SOAP — never call under StackLock.
+bool ReresolveMovedCamera(const onvif_discovered_t & d, CameraConfig::CameraEntry & entry)
+{
+    onvif_resolved_bridge_t res;
+    std::string cu = entry.onvif.user.empty() ? gDefaultUser : entry.onvif.user;
+    std::string cp = entry.onvif.pass.empty() ? gDefaultPass : entry.onvif.pass;
+    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+    {
+        cu.clear();
+        cp.clear();
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+    }
+    if (drc != ONVIF_BRIDGE_OK)
+        return false;
+
+    entry.controlUrl        = d.control_url;
+    entry.onvif.rtspUrl     = res.rtsp_url;
+    entry.onvif.ptzUrl      = res.ptz_url;
+    entry.onvif.snapshotUrl = res.snapshot_url;
+    entry.onvif.token       = res.token;
+    entry.onvif.user        = cu;
+    entry.onvif.pass        = cp;
+    return true;
+}
+
+struct DiscoverResult
+{
+    int found   = 0; // ONVIF responders returned by onvif_ws_discover (<0 = scan error)
+    int added   = 0; // NEW cameras onboarded (bridged endpoints created) this scan
+    int updated = 0; // known cameras whose IP changed and were re-resolved in place
+};
+
+// Shared WS-Discovery scan+resolve+merge used by BOTH boot (ApplicationInit) and the
+// runtime `discover` IPC op, so the two behave identically. It:
+//   • runs the BLOCKING native scan (onvif_ws_discover) and per-camera ONVIF resolve;
+//   • matches responders to `list` by STABLE identity (MAC), not the volatile URN/IP;
+//   • appends newly-resolved cameras and updates moved ones in place in `list`.
+//
+// When createEndpointsLive is true it ALSO makes each new/moved camera live via
+// AddCamera / RemoveCameraByDni.  THREADING: this runs on the IPC accept thread (a
+// foreign thread) and MUST NOT be wrapped in StackLock — onvif_ws_discover /
+// onvif_resolve_bridge block for seconds and would stall the Matter event loop, and
+// AddCamera / RemoveCameraByDni each take StackLock internally for just the ember
+// mutation, so an outer StackLock would self-deadlock. This is exactly the lock
+// discipline HandleIpcUpsert uses (resolve on the IPC thread BEFORE the locked
+// section). At boot the caller is single-threaded (no event loop yet), so createLive
+// is false and the post-scan loop builds every endpoint.
+DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool createEndpointsLive)
+{
+    DiscoverResult result;
+
+    onvif_discovered_t found[16];
+    int nf       = onvif_ws_discover(found, 16, /*wait_secs=*/4);
+    result.found = nf;
+    ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nf);
+
+    for (int i = 0; i < nf; ++i)
+    {
+        std::string sid = StableCameraId(found[i].urn);
+
+        // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
+        CameraConfig::CameraEntry * match = nullptr;
+        for (auto & e : list)
+            if (StableCameraId(e.dni) == sid)
+            {
+                match = &e;
+                break;
+            }
+
+        if (match != nullptr)
+        {
+            match->dni = sid; // migrate any old full-URN dni to the stable form
+            // Same physical camera. If its control URL (DHCP IP) changed, re-resolve and
+            // update it IN PLACE so a reconnect doesn't spawn a duplicate bridged camera.
+            if (match->controlUrl != found[i].control_url)
+            {
+                CameraConfig::CameraEntry updated = *match;
+                if (ReresolveMovedCamera(found[i], updated))
+                {
+                    ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)",
+                                    sid.c_str(), match->controlUrl.c_str(), found[i].control_url);
+                    *match = updated;
+                    if (createEndpointsLive)
+                    {
+                        // Rebuild the live endpoint (same Remove-then-Add path as upsert_camera).
+                        RemoveCameraByDni(sid);
+                        if (AddCamera(updated) < 0)
+                            ChipLogError(Camera, "CameraBridge: discover failed to rebuild endpoint for %s", sid.c_str());
+                    }
+                    result.updated++;
+                }
+                else
+                {
+                    ChipLogProgress(Camera, "CameraBridge: camera %s new IP %s failed to resolve — keeping previous",
+                                    sid.c_str(), found[i].control_url);
+                }
+            }
+            continue;
+        }
+
+        // New camera: resolve with the default ONVIF login (anonymous fallback).
+        CameraConfig::CameraEntry e;
+        if (!ResolveDiscoveredCamera(found[i], sid, e))
+        {
+            ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (resolve failed) — skipping",
+                            found[i].urn);
+            continue;
+        }
+        ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
+                        e.onvif.rtspUrl.c_str());
+        if (createEndpointsLive)
+        {
+            // Create the bridged endpoint LIVE (same path upsert_camera uses at runtime).
+            if (AddCamera(e) < 0)
+            {
+                ChipLogError(Camera, "CameraBridge: discover failed to add endpoint for '%s'", e.name.c_str());
+                continue;
+            }
+        }
+        list.push_back(std::move(e));
+        result.added++;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // IPC callbacks — run on the BridgeIpc accept thread (a foreign thread).
 // ---------------------------------------------------------------------------
 BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
@@ -535,6 +699,50 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
     return out;
 }
 
+// [single_bridge] Runtime LAN rescan (Edge pull-to-refresh): run native WS-Discovery,
+// onboard newly-found cameras and update moved ones, then persist. This is the same
+// work ApplicationInit does once at boot, sharing RunDiscovery().
+//
+// Lock discipline (mirrors HandleIpcUpsert): the BLOCKING scan + per-camera ONVIF
+// resolve happen on this IPC thread FIRST, with NO StackLock held; the ember/registry
+// endpoint mutations run under StackLock taken INTERNALLY by AddCamera /
+// RemoveCameraByDni (createEndpointsLive=true) — never via ScheduleWork (the POSIX
+// event loop dispatches scheduled work with the non-recursive stack mutex already
+// held, so an inner StackLock would deadlock). gBridgedCameras is mutated only on this
+// thread, so it needs no separate lock.
+BridgeIpc::OpResult HandleIpcDiscover()
+{
+    BridgeIpc::OpResult out;
+
+    // Snapshot the currently-bridged cameras so RunDiscovery can match known cameras
+    // by stable id; the live truth (gBridgedCameras) is mutated by AddCamera/Remove.
+    std::vector<CameraConfig::CameraEntry> list;
+    list.reserve(gBridgedCameras.size());
+    for (const auto & c : gBridgedCameras)
+        list.push_back(c->GetEntry());
+
+    DiscoverResult dr = RunDiscovery(list, /*createEndpointsLive=*/true);
+    if (dr.found < 0)
+    {
+        out.status = "unreachable";
+        out.error  = "WS-Discovery scan failed";
+        ChipLogError(Camera, "CameraBridge: discover scan failed (rc=%d)", dr.found);
+        return out;
+    }
+
+    if (dr.added > 0 || dr.updated > 0)
+        PersistCameras();
+
+    out.ok       = true;
+    out.status   = "ok";
+    out.found    = dr.found;
+    out.added    = dr.added;
+    out.endpoint = static_cast<int>(gBridgedCameras.size()); // total bridged now (result.cameras)
+    ChipLogProgress(Camera, "CameraBridge: discover -> found=%d added=%d updated=%d cameras=%zu", dr.found, dr.added,
+                    dr.updated, gBridgedCameras.size());
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Named-pipe command glue (re-use CameraAppCommandDelegate for single-camera
 // commands; extend later for per-camera index).
@@ -640,96 +848,11 @@ void ApplicationInit()
     // anonymous). Together with the PersistCameras() below, the bridge populates
     // cameras.json itself — no separate "ONVIF Camera Manager" Edge driver needed. Runs at
     // startup (single-threaded, before the event loop / IPC thread), so cameras are present
-    // at commission time (which the commissioning rule requires).
+    // at commission time (which the commissioning rule requires). The same RunDiscovery()
+    // backs the runtime `discover` IPC op (Edge pull-to-refresh); here createEndpointsLive
+    // is false because the post-scan loop below builds every endpoint.
     // ------------------------------------------------------------------
-    {
-        onvif_discovered_t found[16];
-        int nf = onvif_ws_discover(found, 16, /*wait_secs=*/4);
-        ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nf);
-        for (int i = 0; i < nf; ++i)
-        {
-            std::string sid = StableCameraId(found[i].urn);
-
-            // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
-            CameraConfig::CameraEntry * match = nullptr;
-            for (auto & e : cameraList)
-                if (StableCameraId(e.dni) == sid)
-                {
-                    match = &e;
-                    break;
-                }
-
-            if (match != nullptr)
-            {
-                match->dni = sid; // migrate any old full-URN dni to the stable form
-                // Same physical camera. If its control URL (DHCP IP) changed, re-resolve and
-                // update it IN PLACE so a reconnect doesn't spawn a duplicate bridged camera.
-                if (match->controlUrl != found[i].control_url)
-                {
-                    onvif_resolved_bridge_t res;
-                    std::string cu = match->onvif.user.empty() ? gDefaultUser : match->onvif.user;
-                    std::string cp = match->onvif.pass.empty() ? gDefaultPass : match->onvif.pass;
-                    int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
-                    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
-                    {
-                        cu.clear();
-                        cp.clear();
-                        drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
-                    }
-                    if (drc == ONVIF_BRIDGE_OK)
-                    {
-                        ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)", sid.c_str(),
-                                        match->controlUrl.c_str(), found[i].control_url);
-                        match->controlUrl        = found[i].control_url;
-                        match->onvif.rtspUrl     = res.rtsp_url;
-                        match->onvif.ptzUrl      = res.ptz_url;
-                        match->onvif.snapshotUrl = res.snapshot_url;
-                        match->onvif.token       = res.token;
-                        match->onvif.user        = cu;
-                        match->onvif.pass        = cp;
-                    }
-                    else
-                    {
-                        ChipLogProgress(Camera, "CameraBridge: camera %s new IP %s failed to resolve — keeping previous",
-                                        sid.c_str(), found[i].control_url);
-                    }
-                }
-                continue;
-            }
-
-            // Resolve with the default ONVIF login if one is set, else anonymously
-            // (and fall back to anonymous if the default creds are rejected).
-            onvif_resolved_bridge_t res;
-            std::string cu = gDefaultUser, cp = gDefaultPass;
-            int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
-            if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
-            {
-                cu.clear();
-                cp.clear();
-                drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
-            }
-            if (drc != ONVIF_BRIDGE_OK)
-            {
-                ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (resolve failed) — skipping",
-                                found[i].urn);
-                continue;
-            }
-            CameraConfig::CameraEntry e;
-            e.name          = found[i].name[0] ? found[i].name : "ONVIF Camera";
-            e.dni           = sid;
-            e.controlUrl    = found[i].control_url;
-            e.stream        = "mainstream";
-            e.onvif.rtspUrl     = res.rtsp_url;
-            e.onvif.ptzUrl      = res.ptz_url;
-            e.onvif.snapshotUrl = res.snapshot_url;
-            e.onvif.token       = res.token;
-            e.onvif.user        = cu;
-            e.onvif.pass        = cp;
-            ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
-                            e.onvif.rtspUrl.c_str());
-            cameraList.push_back(std::move(e));
-        }
-    }
+    RunDiscovery(cameraList, /*createEndpointsLive=*/false);
 
     // Only synthesize a single-camera CLI fallback when cameras.json is ABSENT.
     // A present-but-empty file ("[]") explicitly means "no cameras yet — the Edge
@@ -781,6 +904,7 @@ void ApplicationInit()
     ipcCallbacks.count  = []() -> size_t { return gCameraCount.load(); };
     ipcCallbacks.setDefaultCreds =
         [](const std::string & u, const std::string & p) { return HandleSetDefaultCreds(u, p); };
+    ipcCallbacks.discover = []() { return HandleIpcDiscover(); };
     if (!BridgeIpc::Start(9444, std::move(ipcCallbacks)))
     {
         ChipLogError(Camera, "CameraBridge: IPC server failed to start on :9444 (runtime add/remove disabled)");
