@@ -39,3 +39,9 @@
 // Raise if more than 16 cameras are needed; lower to reduce RAM on constrained hubs.
 #undef CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT
 #define CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT 16
+
+// Keep extended (commissionable-node DNS-SD) discovery running forever: an
+// uncommissioned bridge must stay scannable indefinitely — users pair it long
+// after boot, not within a fixed post-boot window.
+#undef CHIP_DEVICE_CONFIG_EXTENDED_DISCOVERY_TIMEOUT_SECS
+#define CHIP_DEVICE_CONFIG_EXTENDED_DISCOVERY_TIMEOUT_SECS CHIP_DEVICE_CONFIG_DISCOVERY_NO_TIMEOUT

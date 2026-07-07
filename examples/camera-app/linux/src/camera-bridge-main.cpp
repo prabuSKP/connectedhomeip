@@ -533,6 +533,379 @@ void PersistCameras()
 }
 
 // ---------------------------------------------------------------------------
+// LAN discovery (native mDNS + WS-Discovery; boot + on-demand IPC `discover`)
+// ---------------------------------------------------------------------------
+
+// Resolve a freshly-discovered camera with the bridge default ONVIF login, falling
+// back to anonymous if the default creds are rejected. On success fills a complete
+// CameraEntry and returns true; returns false if the camera needs credentials we
+// don't have (caller skips it). BLOCKING SOAP — never call under StackLock.
+bool ResolveDiscoveredCamera(const onvif_discovered_t & d, const std::string & sid, CameraConfig::CameraEntry & e)
+{
+    onvif_resolved_bridge_t res;
+    std::string cu = gDefaultUser, cp = gDefaultPass;
+    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+    {
+        cu.clear(); // default creds rejected — fall back to anonymous
+        cp.clear();
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+    }
+    if (drc != ONVIF_BRIDGE_OK)
+        return false;
+
+    e.name          = d.name[0] ? d.name : "ONVIF Camera";
+    e.dni           = sid;
+    e.controlUrl    = d.control_url;
+    e.stream        = "mainstream";
+    e.mode          = "onvif"; // WS-Discovery implies a working ONVIF service
+    e.onvif.rtspUrl     = res.rtsp_url;
+    e.onvif.ptzUrl      = res.ptz_url;
+    e.onvif.snapshotUrl = res.snapshot_url;
+    e.onvif.token       = res.token;
+    e.onvif.user        = cu;
+    e.onvif.pass        = cp;
+    return true;
+}
+
+// A known camera's control URL (DHCP IP) changed. Re-resolve it — its own creds
+// first, then the bridge default, then anonymous — and update `entry` IN PLACE so a
+// reconnect doesn't spawn a duplicate. Returns true if re-resolved (entry updated),
+// false to keep the previous config. BLOCKING SOAP — never call under StackLock.
+bool ReresolveMovedCamera(const onvif_discovered_t & d, CameraConfig::CameraEntry & entry)
+{
+    onvif_resolved_bridge_t res;
+    std::string cu = entry.onvif.user.empty() ? gDefaultUser : entry.onvif.user;
+    std::string cp = entry.onvif.pass.empty() ? gDefaultPass : entry.onvif.pass;
+    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+    {
+        cu.clear();
+        cp.clear();
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+    }
+    if (drc != ONVIF_BRIDGE_OK)
+        return false;
+
+    entry.controlUrl        = d.control_url;
+    entry.onvif.rtspUrl     = res.rtsp_url;
+    entry.onvif.ptzUrl      = res.ptz_url;
+    entry.onvif.snapshotUrl = res.snapshot_url;
+    entry.onvif.token       = res.token;
+    entry.onvif.user        = cu;
+    entry.onvif.pass        = cp;
+    return true;
+}
+
+struct DiscoverResult
+{
+    int found   = 0; // distinct LAN responders this scan (mDNS ∪ WS-Discovery; <0 = every scan failed)
+    int added   = 0; // NEW cameras onboarded (appended / bridged endpoints created) this scan
+    int updated = 0; // known cameras updated in place (DHCP IP change / identity merge)
+};
+
+// Shared two-pass LAN discovery used by BOTH boot (ApplicationInit) and the runtime
+// `discover` IPC op, so the two behave identically.
+//
+// Pass 1 — mDNS FIRST ([hikvision], user priority): modern Hikvision cameras ship ONVIF
+// (hence WS-Discovery) DISABLED by default but Bonjour ON, so the WS-Discovery pass below
+// is blind to them. Per mDNS device: tier-1 ONVIF resolve anyway (in case the user enabled
+// it — that yields PTZ/snapshot for free); otherwise tier-2 onboarding via a directly-formed
+// RTSP URL (direct mode, TryDirectRtsp). Two-stage identity (A3, G1/G2): stage A dedups
+// known cameras WITHOUT contacting them (opportunistic ARP + serial + host IP), stage B
+// re-reads ARP AFTER a successful contact for the authoritative MAC id. LOCKOUT-CRITICAL
+// (A5): at most ONE failed login per camera per scan — known cameras are never
+// re-authenticated, an ONVIF AUTH rejection aborts before the RTSP probe, and TryDirectRtsp
+// itself makes a single credentialed attempt. See docs/HIKVISION_DISCOVERY_PLAN.md.
+//
+// Pass 2 — WS-Discovery: ONVIF-enabled cameras. Matches responders to `list` by STABLE
+// identity (MAC, StableCameraId) — not the volatile URN/IP — plus a by-IP crosscheck
+// against entries the mDNS pass may have keyed hik-serial-… (G1); appends newly-resolved
+// cameras and updates moved ones in place.
+//
+// COUNTING: `found` totals distinct responders — every mDNS responder plus each WS-D
+// responder whose host IP the mDNS pass did not already report (a camera answering both
+// passes is one physical device, counted once). `added` = new cameras onboarded; `updated`
+// = known cameras rewritten in place (IP change / identity merge).
+//
+// When createEndpointsLive is true it ALSO makes each new/updated camera live via
+// AddCamera / RemoveCameraByDni.  THREADING: this runs on the IPC accept thread (a
+// foreign thread) and MUST NOT be wrapped in StackLock — the two scans, the ONVIF
+// resolves and the RTSP probes block for seconds and would stall the Matter event loop,
+// and AddCamera / RemoveCameraByDni each take StackLock internally for just the ember
+// mutation, so an outer StackLock would self-deadlock (ScheduleWork is just as forbidden:
+// the POSIX event loop dispatches scheduled work with the non-recursive stack mutex
+// already held). This is exactly the lock discipline HandleIpcUpsert uses (resolve on the
+// IPC thread BEFORE the locked section). At boot the caller is single-threaded (no event
+// loop yet), createEndpointsLive is false, and ApplicationInit's post-scan loop builds
+// every endpoint.
+DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool createEndpointsLive)
+{
+    DiscoverResult result;
+
+    // Rebuild the live bridged endpoint of an entry that changed: same Remove-then-Add
+    // path upsert_camera uses at runtime. `oldDni` can differ from entry.dni when an
+    // identity merge just migrated it (e.g. hik-serial-… → onvif-mac-…) — the live
+    // endpoint is still keyed on the old one.
+    auto rebuildLive = [](const std::string & oldDni, const CameraConfig::CameraEntry & entry) {
+        RemoveCameraByDni(oldDni);
+        if (AddCamera(entry) < 0)
+            ChipLogError(Camera, "CameraBridge: discover failed to rebuild endpoint for %s", entry.dni.c_str());
+    };
+
+    // ------------------------------------------------------------------
+    // Pass 1: mDNS ([hikvision]).
+    // ------------------------------------------------------------------
+    std::vector<std::string> mdnsIps; // responder IPs — pass 2 uses them to avoid double-counting `found`
+    mdns_found_t mdnsFound[16];
+    int nMdns = onvif_mdns_discover(mdnsFound, 16, /*wait_secs=*/4);
+    ChipLogProgress(Camera, "CameraBridge: mDNS found %d Hikvision camera(s) on the LAN", nMdns);
+    if (nMdns > 0)
+        result.found += nMdns;
+    for (int i = 0; i < nMdns; ++i)
+    {
+        std::string ip = mdnsFound[i].ip;
+        mdnsIps.push_back(ip);
+
+        // Two-stage identity (A3, G1/G2). ARP is only guaranteed complete AFTER a TCP
+        // contact with the camera, so the authoritative MAC id is read post-contact in
+        // stage B below. Stage A (here) decides "already known?" WITHOUT contacting the
+        // camera — no login attempt is ever spent on a known camera (A5) — by matching
+        // opportunistic ARP (often warm from the mDNS reply itself), the entry's host IP,
+        // and the serial-fallback id, so entries persisted under EITHER id form
+        // (onvif-mac-… or hik-serial-…) are recognized (G1).
+        std::string arpSid    = MacFromArp(ip); // opportunistic — may be "" pre-contact
+        std::string serialSid = mdnsFound[i].serial[0] ? std::string("hik-serial-") + mdnsFound[i].serial : std::string();
+
+        CameraConfig::CameraEntry * match = nullptr;
+        for (auto & e : list)
+        {
+            std::string esid = StableCameraId(e.dni);
+            if ((!arpSid.empty() && esid == arpSid) || (!serialSid.empty() && esid == serialSid) ||
+                HostFromUrl(e.controlUrl) == ip || HostFromUrl(e.onvif.rtspUrl) == ip)
+            {
+                match = &e;
+                break;
+            }
+        }
+        if (match != nullptr)
+        {
+            // Already known. For a direct camera, rebuild its RTSP URL in place on a DHCP
+            // IP change (the mirror of the WS-D control-URL update below).
+            if (match->mode == "direct")
+            {
+                std::string newUrl = "rtsp://" + ip + ":554/Streaming/Channels/" +
+                    (match->stream == "substream" ? "102" : "101");
+                if (match->onvif.rtspUrl != newUrl)
+                {
+                    ChipLogProgress(Camera, "CameraBridge: direct camera %s IP changed -> %s (rtsp updated in place)",
+                                    match->dni.c_str(), ip.c_str());
+                    match->onvif.rtspUrl = newUrl;
+                    result.updated++;
+                    if (createEndpointsLive)
+                        rebuildLive(match->dni, *match);
+                }
+            }
+            continue;
+        }
+
+        // Stage B helpers, used only after a SUCCESSFUL resolve/probe (i.e. a completed TCP
+        // handshake, which guarantees a complete 0x2 ARP entry — A3/G2). The serial fallback
+        // should be near-impossible past that point.
+        auto authoritativeSid = [&ip, &mdnsFound, i]() {
+            std::string s = MacFromArp(ip);
+            return s.empty() ? std::string("hik-serial-") + mdnsFound[i].serial : s;
+        };
+        // Final dedup (G1): stage A can miss when ARP was cold and the camera is persisted
+        // under onvif-mac-… with a since-changed IP (e.g. onboarded via WS-D on an earlier
+        // boot). Now that the id is authoritative, fold the fresh resolve into the existing
+        // entry in place instead of appending a duplicate bridged camera.
+        auto mergeOrAppend = [&list, &result, &rebuildLive, createEndpointsLive](CameraConfig::CameraEntry && e) {
+            for (auto & known : list)
+                if (StableCameraId(known.dni) == StableCameraId(e.dni))
+                {
+                    ChipLogProgress(Camera,
+                                    "CameraBridge: mDNS camera %s already known under its authoritative id (updated in place)",
+                                    e.dni.c_str());
+                    known.controlUrl = e.controlUrl;
+                    known.stream     = e.stream;
+                    known.mode       = e.mode;
+                    known.onvif      = e.onvif;
+                    result.updated++;
+                    if (createEndpointsLive)
+                        rebuildLive(known.dni, known);
+                    return;
+                }
+            if (createEndpointsLive)
+            {
+                // Create the bridged endpoint LIVE (same path upsert_camera uses at runtime).
+                if (AddCamera(e) < 0)
+                {
+                    ChipLogError(Camera, "CameraBridge: discover failed to add endpoint for '%s'", e.name.c_str());
+                    return; // not appended — the caller's list must keep mirroring the live set
+                }
+            }
+            list.push_back(std::move(e));
+            result.added++;
+        };
+
+        // Tier 1 (A1): ONVIF resolve — works only if the user enabled ONVIF. For an
+        // ONVIF-disabled camera the /onvif/device_service endpoint isn't served, so this
+        // fails on the HTTP layer WITHOUT a login attempt (no lockout risk).
+        std::string controlUrl = "http://" + ip + "/onvif/device_service";
+        std::string cu = gDefaultUser, cp = gDefaultPass;
+        onvif_resolved_bridge_t res;
+        int drc = onvif_resolve_bridge(controlUrl.c_str(), cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+        if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
+        {
+            drc = onvif_resolve_bridge(controlUrl.c_str(), "", "", 1, &res);
+            if (drc == ONVIF_BRIDGE_OK)
+            {
+                cu.clear();
+                cp.clear();
+            }
+        }
+        if (drc == ONVIF_BRIDGE_OK)
+        {
+            // Stage B (A3/G2): the resolve's TCP contact just completed — read ARP NOW for
+            // the authoritative MAC id, not the possibly-cold pre-contact one.
+            CameraConfig::CameraEntry e;
+            e.name       = mdnsFound[i].name[0] ? mdnsFound[i].name : "ONVIF Camera";
+            e.dni        = authoritativeSid();
+            e.controlUrl = controlUrl;
+            e.stream     = "mainstream";
+            e.mode       = "onvif";
+            e.onvif.rtspUrl     = res.rtsp_url;
+            e.onvif.ptzUrl      = res.ptz_url;
+            e.onvif.snapshotUrl = res.snapshot_url;
+            e.onvif.token       = res.token;
+            e.onvif.user        = cu;
+            e.onvif.pass        = cp;
+            ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
+                            e.dni.c_str(), e.onvif.rtspUrl.c_str());
+            mergeOrAppend(std::move(e));
+            continue;
+        }
+
+        // If ONVIF explicitly rejected the creds, the same creds will fail RTSP too — skip
+        // direct mode so we don't burn the camera's login-lock budget (A5).
+        if (drc == ONVIF_BRIDGE_AUTH)
+        {
+            ChipLogProgress(Camera, "CameraBridge: mDNS camera %s ONVIF auth failed — skipping (fix default creds)",
+                            ip.c_str());
+            continue;
+        }
+
+        // Tier 2 (A1/A5): directly-formed RTSP with the default login (single auth attempt).
+        // The pre-contact id passed here is provisional (for the probe's own log line);
+        // stage B overwrites it with the post-contact authoritative id on success.
+        CameraConfig::CameraEntry e;
+        std::string codec;
+        if (TryDirectRtsp(ip, mdnsFound[i].name, gDefaultUser, gDefaultPass,
+                          arpSid.empty() ? std::string("hik-serial-") + mdnsFound[i].serial : arpSid, e,
+                          codec) == RTSP_PROBE_OK)
+        {
+            // Stage B (A3/G2): the probe's TCP contact just completed — re-read ARP for the
+            // authoritative MAC id.
+            e.dni = authoritativeSid();
+            mergeOrAppend(std::move(e));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Pass 2: WS-Discovery (ONVIF-enabled cameras).
+    // ------------------------------------------------------------------
+    onvif_discovered_t wsdFound[16];
+    int nWsd = onvif_ws_discover(wsdFound, 16, /*wait_secs=*/4);
+    ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nWsd);
+    for (int i = 0; i < nWsd; ++i)
+    {
+        std::string sid = StableCameraId(wsdFound[i].urn);
+
+        // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
+        // [hikvision] Also crosscheck by host IP (G1): the mDNS pass above may have keyed
+        // this same camera hik-serial-… (ARP fallback) while its WS-D URN yields
+        // onvif-mac-… — the shared IP is what ties the two views to one physical device.
+        std::string wsdHost = HostFromUrl(wsdFound[i].control_url);
+
+        // `found` dedup: a responder whose IP already answered the mDNS pass is the same
+        // physical camera — count it once across both passes.
+        bool seenByMdns = false;
+        for (const auto & mip : mdnsIps)
+            if (!wsdHost.empty() && mip == wsdHost)
+            {
+                seenByMdns = true;
+                break;
+            }
+        if (!seenByMdns)
+            result.found++;
+
+        CameraConfig::CameraEntry * match = nullptr;
+        for (auto & e : list)
+            if (StableCameraId(e.dni) == sid ||
+                (!wsdHost.empty() && (HostFromUrl(e.controlUrl) == wsdHost || HostFromUrl(e.onvif.rtspUrl) == wsdHost)))
+            {
+                match = &e;
+                break;
+            }
+
+        if (match != nullptr)
+        {
+            const std::string oldDni = match->dni; // a live endpoint stays keyed on this until rebuilt
+            match->dni               = sid;        // migrate any old full-URN / hik-serial dni to the stable form
+            // Same physical camera. If its control URL (DHCP IP) changed, re-resolve and
+            // update it IN PLACE so a reconnect doesn't spawn a duplicate bridged camera.
+            if (match->controlUrl != wsdFound[i].control_url)
+            {
+                CameraConfig::CameraEntry updated = *match;
+                if (ReresolveMovedCamera(wsdFound[i], updated))
+                {
+                    ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)", sid.c_str(),
+                                    match->controlUrl.c_str(), wsdFound[i].control_url);
+                    *match = updated;
+                    result.updated++;
+                    if (createEndpointsLive)
+                        rebuildLive(oldDni, *match);
+                }
+                else
+                {
+                    ChipLogProgress(Camera, "CameraBridge: camera %s new IP %s failed to resolve — keeping previous",
+                                    sid.c_str(), wsdFound[i].control_url);
+                }
+            }
+            continue;
+        }
+
+        // New camera: resolve with the default ONVIF login (anonymous fallback).
+        CameraConfig::CameraEntry e;
+        if (!ResolveDiscoveredCamera(wsdFound[i], sid, e))
+        {
+            ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (resolve failed) — skipping",
+                            wsdFound[i].urn);
+            continue;
+        }
+        ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
+                        e.onvif.rtspUrl.c_str());
+        if (createEndpointsLive)
+        {
+            // Create the bridged endpoint LIVE (same path upsert_camera uses at runtime).
+            if (AddCamera(e) < 0)
+            {
+                ChipLogError(Camera, "CameraBridge: discover failed to add endpoint for '%s'", e.name.c_str());
+                continue;
+            }
+        }
+        list.push_back(std::move(e));
+        result.added++;
+    }
+
+    if (nMdns < 0 && nWsd < 0)
+        result.found = -1; // BOTH scans failed outright (socket errors) — signal a scan error to the IPC caller
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // IPC callbacks — run on the BridgeIpc accept thread (a foreign thread).
 // ---------------------------------------------------------------------------
 BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
@@ -735,6 +1108,57 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
     return out;
 }
 
+// [single_bridge] Runtime LAN rescan (Edge pull-to-refresh): run the same two-pass native
+// discovery as boot (mDNS first, then WS-Discovery — shared RunDiscovery()), onboard
+// newly-found cameras and update moved ones live, then persist.
+//
+// DURATION: the two scans block ~4 s each, plus per-camera ONVIF resolves / RTSP probes
+// — expect ~8-10 s end to end (more when several new cameras need resolving), during
+// which no response byte is sent. The IPC client's request timeout must comfortably
+// exceed that: a 12 s budget covers the common case with little headroom (note the stock
+// bridge_ipc.lua M.TIMEOUT of 5 s is NOT enough for this op) — revisit before adding any
+// further scan pass.
+//
+// Lock discipline (mirrors HandleIpcUpsert): the BLOCKING scans + per-camera ONVIF
+// resolve / RTSP probe happen on this IPC thread FIRST, with NO StackLock held; the
+// ember/registry endpoint mutations run under StackLock taken INTERNALLY by AddCamera /
+// RemoveCameraByDni (createEndpointsLive=true) — never via ScheduleWork (the POSIX
+// event loop dispatches scheduled work with the non-recursive stack mutex already
+// held, so an inner StackLock would deadlock). gBridgedCameras is mutated only on this
+// thread, so it needs no separate lock.
+BridgeIpc::OpResult HandleIpcDiscover()
+{
+    BridgeIpc::OpResult out;
+
+    // Snapshot the currently-bridged cameras so RunDiscovery can match known cameras
+    // by stable id; the live truth (gBridgedCameras) is mutated by AddCamera/Remove.
+    std::vector<CameraConfig::CameraEntry> list;
+    list.reserve(gBridgedCameras.size());
+    for (const auto & c : gBridgedCameras)
+        list.push_back(c->GetEntry());
+
+    DiscoverResult dr = RunDiscovery(list, /*createEndpointsLive=*/true);
+    if (dr.found < 0)
+    {
+        out.status = "unreachable";
+        out.error  = "discovery scan failed (mDNS + WS-Discovery)";
+        ChipLogError(Camera, "CameraBridge: discover scan failed (rc=%d)", dr.found);
+        return out;
+    }
+
+    if (dr.added > 0 || dr.updated > 0)
+        PersistCameras();
+
+    out.ok       = true;
+    out.status   = "ok";
+    out.found    = dr.found;
+    out.added    = dr.added;
+    out.endpoint = static_cast<int>(gBridgedCameras.size()); // total bridged now (result.cameras)
+    ChipLogProgress(Camera, "CameraBridge: discover -> found=%d added=%d updated=%d cameras=%zu", dr.found, dr.added,
+                    dr.updated, gBridgedCameras.size());
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Named-pipe command glue (re-use CameraAppCommandDelegate for single-camera
 // commands; extend later for per-camera index).
@@ -835,252 +1259,18 @@ void ApplicationInit()
     }
 
     // ------------------------------------------------------------------
-    // [hikvision] mDNS discovery FIRST (user priority): modern Hikvision cameras ship ONVIF
-    // (hence WS-Discovery) DISABLED by default but Bonjour ON, so the WS-Discovery pass below
-    // is blind to them. Per mDNS device: try ONVIF resolve anyway (in case the user enabled it
-    // — that yields PTZ/snapshot for free); otherwise onboard via a directly-formed RTSP URL
-    // (direct mode). See docs/HIKVISION_DISCOVERY_PLAN.md.
-    // ------------------------------------------------------------------
-    {
-        mdns_found_t found[16];
-        int nf = onvif_mdns_discover(found, 16, /*wait_secs=*/4);
-        ChipLogProgress(Camera, "CameraBridge: mDNS found %d Hikvision camera(s) on the LAN", nf);
-        for (int i = 0; i < nf; ++i)
-        {
-            std::string ip = found[i].ip;
-
-            // Two-stage identity (A3, G1/G2). ARP is only guaranteed complete AFTER a TCP
-            // contact with the camera, so the authoritative MAC id is read post-contact in
-            // stage B below. Stage A (here) decides "already known?" WITHOUT contacting the
-            // camera — no login attempt is ever spent on a known camera (A5) — by matching
-            // opportunistic ARP (often warm from the mDNS reply itself), the entry's host IP,
-            // and the serial-fallback id, so entries persisted under EITHER id form
-            // (onvif-mac-… or hik-serial-…) are recognized (G1).
-            std::string arpSid    = MacFromArp(ip); // opportunistic — may be "" pre-contact
-            std::string serialSid = found[i].serial[0] ? std::string("hik-serial-") + found[i].serial : std::string();
-
-            CameraConfig::CameraEntry * match = nullptr;
-            for (auto & e : cameraList)
-            {
-                std::string esid = StableCameraId(e.dni);
-                if ((!arpSid.empty() && esid == arpSid) || (!serialSid.empty() && esid == serialSid) ||
-                    HostFromUrl(e.controlUrl) == ip || HostFromUrl(e.onvif.rtspUrl) == ip)
-                {
-                    match = &e;
-                    break;
-                }
-            }
-            if (match != nullptr)
-            {
-                // Already known. For a direct camera, rebuild its RTSP URL in place on a DHCP
-                // IP change (the mirror of the WS-D control-URL update below).
-                if (match->mode == "direct")
-                {
-                    std::string newUrl = "rtsp://" + ip + ":554/Streaming/Channels/" +
-                        (match->stream == "substream" ? "102" : "101");
-                    if (match->onvif.rtspUrl != newUrl)
-                    {
-                        ChipLogProgress(Camera, "CameraBridge: direct camera %s IP changed -> %s (rtsp updated in place)",
-                                        match->dni.c_str(), ip.c_str());
-                        match->onvif.rtspUrl = newUrl;
-                    }
-                }
-                continue;
-            }
-
-            // Stage B helpers, used only after a SUCCESSFUL resolve/probe (i.e. a completed TCP
-            // handshake, which guarantees a complete 0x2 ARP entry — A3/G2). The serial fallback
-            // should be near-impossible past that point.
-            auto authoritativeSid = [&ip, &found, i]() {
-                std::string s = MacFromArp(ip);
-                return s.empty() ? std::string("hik-serial-") + found[i].serial : s;
-            };
-            // Final dedup (G1): stage A can miss when ARP was cold and the camera is persisted
-            // under onvif-mac-… with a since-changed IP (e.g. onboarded via WS-D on an earlier
-            // boot). Now that the id is authoritative, fold the fresh resolve into the existing
-            // entry in place instead of appending a duplicate bridged camera.
-            auto mergeOrAppend = [&cameraList](CameraConfig::CameraEntry && e) {
-                for (auto & known : cameraList)
-                    if (StableCameraId(known.dni) == StableCameraId(e.dni))
-                    {
-                        ChipLogProgress(Camera,
-                                        "CameraBridge: mDNS camera %s already known under its authoritative id (updated in place)",
-                                        e.dni.c_str());
-                        known.controlUrl = e.controlUrl;
-                        known.stream     = e.stream;
-                        known.mode       = e.mode;
-                        known.onvif      = e.onvif;
-                        return;
-                    }
-                cameraList.push_back(std::move(e));
-            };
-
-            // Tier 1 (A1): ONVIF resolve — works only if the user enabled ONVIF. For an
-            // ONVIF-disabled camera the /onvif/device_service endpoint isn't served, so this
-            // fails on the HTTP layer WITHOUT a login attempt (no lockout risk).
-            std::string controlUrl = "http://" + ip + "/onvif/device_service";
-            std::string cu = gDefaultUser, cp = gDefaultPass;
-            onvif_resolved_bridge_t res;
-            int drc = onvif_resolve_bridge(controlUrl.c_str(), cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
-            if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
-            {
-                drc = onvif_resolve_bridge(controlUrl.c_str(), "", "", 1, &res);
-                if (drc == ONVIF_BRIDGE_OK)
-                {
-                    cu.clear();
-                    cp.clear();
-                }
-            }
-            if (drc == ONVIF_BRIDGE_OK)
-            {
-                // Stage B (A3/G2): the resolve's TCP contact just completed — read ARP NOW for
-                // the authoritative MAC id, not the possibly-cold pre-contact one.
-                CameraConfig::CameraEntry e;
-                e.name       = found[i].name[0] ? found[i].name : "ONVIF Camera";
-                e.dni        = authoritativeSid();
-                e.controlUrl = controlUrl;
-                e.stream     = "mainstream";
-                e.mode       = "onvif";
-                e.onvif.rtspUrl     = res.rtsp_url;
-                e.onvif.ptzUrl      = res.ptz_url;
-                e.onvif.snapshotUrl = res.snapshot_url;
-                e.onvif.token       = res.token;
-                e.onvif.user        = cu;
-                e.onvif.pass        = cp;
-                ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
-                                e.dni.c_str(), e.onvif.rtspUrl.c_str());
-                mergeOrAppend(std::move(e));
-                continue;
-            }
-
-            // If ONVIF explicitly rejected the creds, the same creds will fail RTSP too — skip
-            // direct mode so we don't burn the camera's login-lock budget (A5).
-            if (drc == ONVIF_BRIDGE_AUTH)
-            {
-                ChipLogProgress(Camera, "CameraBridge: mDNS camera %s ONVIF auth failed — skipping (fix default creds)",
-                                ip.c_str());
-                continue;
-            }
-
-            // Tier 2 (A1/A5): directly-formed RTSP with the default login (single auth attempt).
-            // The pre-contact id passed here is provisional (for the probe's own log line);
-            // stage B overwrites it with the post-contact authoritative id on success.
-            CameraConfig::CameraEntry e;
-            std::string codec;
-            if (TryDirectRtsp(ip, found[i].name, gDefaultUser, gDefaultPass,
-                              arpSid.empty() ? std::string("hik-serial-") + found[i].serial : arpSid, e,
-                              codec) == RTSP_PROBE_OK)
-            {
-                // Stage B (A3/G2): the probe's TCP contact just completed — re-read ARP for the
-                // authoritative MAC id.
-                e.dni = authoritativeSid();
-                mergeOrAppend(std::move(e));
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // [single_bridge] WS-Discovery: find ONVIF cameras on the LAN ourselves and add any
-    // not already in the list, resolved with the default ONVIF login (falling back to
+    // [single_bridge][hikvision] Boot discovery: find cameras on the LAN ourselves —
+    // mDNS first (Hikvision cameras with ONVIF disabled), then WS-Discovery
+    // (ONVIF-enabled) — resolved with the default ONVIF login (falling back to
     // anonymous). Together with the PersistCameras() below, the bridge populates
-    // cameras.json itself — no separate "ONVIF Camera Manager" Edge driver needed. Runs at
-    // startup (single-threaded, before the event loop / IPC thread), so cameras are present
-    // at commission time (which the commissioning rule requires).
+    // cameras.json itself — no separate "ONVIF Camera Manager" Edge driver needed.
+    // Runs at startup (single-threaded, before the event loop / IPC thread), so
+    // cameras are present at commission time (which the commissioning rule requires).
+    // The same RunDiscovery() backs the runtime `discover` IPC op (Edge
+    // pull-to-refresh); here createEndpointsLive is false because the post-scan loop
+    // below builds every endpoint.
     // ------------------------------------------------------------------
-    {
-        onvif_discovered_t found[16];
-        int nf = onvif_ws_discover(found, 16, /*wait_secs=*/4);
-        ChipLogProgress(Camera, "CameraBridge: WS-Discovery found %d ONVIF camera(s) on the LAN", nf);
-        for (int i = 0; i < nf; ++i)
-        {
-            std::string sid = StableCameraId(found[i].urn);
-
-            // Match an already-known camera by STABLE identity (MAC), not the volatile URN/IP.
-            // [hikvision] Also crosscheck by host IP (G1): the mDNS pass above may have keyed
-            // this same camera hik-serial-… (ARP fallback) while its WS-D URN yields
-            // onvif-mac-… — the shared IP is what ties the two views to one physical device.
-            std::string wsdHost = HostFromUrl(found[i].control_url);
-            CameraConfig::CameraEntry * match = nullptr;
-            for (auto & e : cameraList)
-                if (StableCameraId(e.dni) == sid ||
-                    (!wsdHost.empty() && (HostFromUrl(e.controlUrl) == wsdHost || HostFromUrl(e.onvif.rtspUrl) == wsdHost)))
-                {
-                    match = &e;
-                    break;
-                }
-
-            if (match != nullptr)
-            {
-                match->dni = sid; // migrate any old full-URN dni to the stable form
-                // Same physical camera. If its control URL (DHCP IP) changed, re-resolve and
-                // update it IN PLACE so a reconnect doesn't spawn a duplicate bridged camera.
-                if (match->controlUrl != found[i].control_url)
-                {
-                    onvif_resolved_bridge_t res;
-                    std::string cu = match->onvif.user.empty() ? gDefaultUser : match->onvif.user;
-                    std::string cp = match->onvif.pass.empty() ? gDefaultPass : match->onvif.pass;
-                    int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
-                    if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
-                    {
-                        cu.clear();
-                        cp.clear();
-                        drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
-                    }
-                    if (drc == ONVIF_BRIDGE_OK)
-                    {
-                        ChipLogProgress(Camera, "CameraBridge: camera %s IP changed %s -> %s (updated in place)", sid.c_str(),
-                                        match->controlUrl.c_str(), found[i].control_url);
-                        match->controlUrl        = found[i].control_url;
-                        match->onvif.rtspUrl     = res.rtsp_url;
-                        match->onvif.ptzUrl      = res.ptz_url;
-                        match->onvif.snapshotUrl = res.snapshot_url;
-                        match->onvif.token       = res.token;
-                        match->onvif.user        = cu;
-                        match->onvif.pass        = cp;
-                    }
-                    else
-                    {
-                        ChipLogProgress(Camera, "CameraBridge: camera %s new IP %s failed to resolve — keeping previous",
-                                        sid.c_str(), found[i].control_url);
-                    }
-                }
-                continue;
-            }
-
-            // Resolve with the default ONVIF login if one is set, else anonymously
-            // (and fall back to anonymous if the default creds are rejected).
-            onvif_resolved_bridge_t res;
-            std::string cu = gDefaultUser, cp = gDefaultPass;
-            int drc = onvif_resolve_bridge(found[i].control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
-            if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
-            {
-                cu.clear();
-                cp.clear();
-                drc = onvif_resolve_bridge(found[i].control_url, "", "", /*want_main=*/1, &res);
-            }
-            if (drc != ONVIF_BRIDGE_OK)
-            {
-                ChipLogProgress(Camera, "CameraBridge: discovered %s needs credentials (resolve failed) — skipping",
-                                found[i].urn);
-                continue;
-            }
-            CameraConfig::CameraEntry e;
-            e.name          = found[i].name[0] ? found[i].name : "ONVIF Camera";
-            e.dni           = sid;
-            e.controlUrl    = found[i].control_url;
-            e.stream        = "mainstream";
-            e.mode          = "onvif";
-            e.onvif.rtspUrl     = res.rtsp_url;
-            e.onvif.ptzUrl      = res.ptz_url;
-            e.onvif.snapshotUrl = res.snapshot_url;
-            e.onvif.token       = res.token;
-            e.onvif.user        = cu;
-            e.onvif.pass        = cp;
-            ChipLogProgress(Camera, "CameraBridge: discovered + resolved '%s' (%s) rtsp=%s", e.name.c_str(), e.dni.c_str(),
-                            e.onvif.rtspUrl.c_str());
-            cameraList.push_back(std::move(e));
-        }
-    }
+    RunDiscovery(cameraList, /*createEndpointsLive=*/false);
 
     // Only synthesize a single-camera CLI fallback when cameras.json is ABSENT.
     // A present-but-empty file ("[]") explicitly means "no cameras yet — the Edge
@@ -1132,6 +1322,7 @@ void ApplicationInit()
     ipcCallbacks.count  = []() -> size_t { return gCameraCount.load(); };
     ipcCallbacks.setDefaultCreds =
         [](const std::string & u, const std::string & p) { return HandleSetDefaultCreds(u, p); };
+    ipcCallbacks.discover = []() { return HandleIpcDiscover(); };
     if (!BridgeIpc::Start(9444, std::move(ipcCallbacks)))
     {
         ChipLogError(Camera, "CameraBridge: IPC server failed to start on :9444 (runtime add/remove disabled)");
