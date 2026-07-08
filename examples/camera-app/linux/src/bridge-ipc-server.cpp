@@ -182,9 +182,25 @@ std::string Dispatch(const std::string & req)
     if (op == "remove_camera")
     {
         std::string dni;
-        if (!ExtractStr(req, "dni", dni) || dni.empty())
-            return FailResponse(hasId, id, "bad_request", "remove_camera requires 'dni'");
-        OpResult r = gCallbacks.remove ? gCallbacks.remove(dni) : OpResult{};
+        ExtractStr(req, "dni", dni);
+        // Alternative key: bare number ("endpoint":3). Clients that cannot learn the
+        // child's UniqueID send the endpoint instead (hub-core does not forward driver
+        // reads of BridgedDeviceBasicInformation, so at delete time the Edge driver
+        // only reliably knows the endpoint from the child's device_network_id).
+        int endpoint = 0;
+        {
+            const std::string needle = "\"endpoint\"";
+            size_t k                 = req.find(needle);
+            if (k != std::string::npos)
+            {
+                size_t colon = req.find(':', k + needle.size());
+                if (colon != std::string::npos)
+                    endpoint = atoi(req.c_str() + colon + 1);
+            }
+        }
+        if (dni.empty() && endpoint <= 0)
+            return FailResponse(hasId, id, "bad_request", "remove_camera requires 'dni' or 'endpoint'");
+        OpResult r = gCallbacks.remove ? gCallbacks.remove(dni, endpoint) : OpResult{};
         if (r.ok)
             return RemoveResponse(id);
         return FailResponse(hasId, id, r.status.empty() ? "internal_error" : r.status, r.error);

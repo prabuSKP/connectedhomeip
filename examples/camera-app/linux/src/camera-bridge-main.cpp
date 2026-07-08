@@ -68,6 +68,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono> // discover debounce: steady_clock timestamp of the last completed scan
 #include <fstream>
 #include <memory>
 #include <sstream> // MacFromArp: parse /proc/net/arp
@@ -1029,10 +1030,32 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     return out;
 }
 
-BridgeIpc::OpResult HandleIpcRemove(const std::string & dni)
+BridgeIpc::OpResult HandleIpcRemove(const std::string & dni, int endpoint)
 {
     BridgeIpc::OpResult out;
-    RemoveCameraByDni(dni); // idempotent: a not-found camera is already "removed"
+    std::string target = dni;
+    // Endpoint fallback: the Edge driver cannot read the child's UniqueID (hub-core
+    // does not forward driver reads of BridgedDeviceBasicInformation), so at delete
+    // time it may only know the endpoint from the child's device_network_id. Resolve
+    // it to the stable dni here — we own the endpoint→camera mapping. Runs on the
+    // IPC thread, the only mutator of gBridgedCameras (no lock needed).
+    if (target.empty() && endpoint > 0)
+    {
+        for (const auto & cam : gBridgedCameras)
+        {
+            if (static_cast<int>(cam->GetEndpointId()) == endpoint)
+            {
+                target = cam->GetEntry().dni;
+                ChipLogProgress(Camera, "CameraBridge: remove_camera endpoint=%d -> dni=%s", endpoint, target.c_str());
+                break;
+            }
+        }
+        if (target.empty())
+            ChipLogProgress(Camera, "CameraBridge: remove_camera endpoint=%d matches no camera (already removed?)",
+                            endpoint);
+    }
+    if (!target.empty())
+        RemoveCameraByDni(target); // idempotent: a not-found camera is already "removed"
     PersistCameras();
     out.ok     = true;
     out.status = "removed";
@@ -1126,9 +1149,45 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
 // event loop dispatches scheduled work with the non-recursive stack mutex already
 // held, so an inner StackLock would deadlock). gBridgedCameras is mutated only on this
 // thread, so it needs no separate lock.
+//
+// DEBOUNCE: a scan costs ~8-10 s of blocking IPC-thread time, and each pull-to-refresh
+// gesture fires one discover op — rapid pulls therefore queue back-to-back FULL scans
+// (observed on hardware: ~10 pulls => ~90 s of continuous scanning). The LAN cannot
+// change meaningfully within seconds, so a request arriving < kDiscoverDebounceSecs
+// after the last completed scan replays that scan's result instead of re-scanning;
+// pulls queued behind an in-flight scan then drain instantly.
+constexpr std::chrono::seconds kDiscoverDebounceSecs{ 10 };
+// Last completed scan's outcome + completion time (steady_clock: monotonic — never wall
+// clock, so NTP jumps can't defeat or extend the window). SINGLE-WRITER: read and
+// written only on the IPC accept thread — the same single-writer assumption
+// gBridgedCameras relies on — so no lock is needed.
+DiscoverResult gLastDiscoverResult;
+std::chrono::steady_clock::time_point gLastDiscoverDone;
+bool gHaveLastDiscover = false; // steady_clock's epoch is boot time, so a zero time_point is NOT "never"
+
 BridgeIpc::OpResult HandleIpcDiscover()
 {
     BridgeIpc::OpResult out;
+
+    // Debounced path: replay the previous scan's `found`, report added=0 (anything that
+    // scan added is already live and persisted), and report the CURRENT bridged-camera
+    // count (not a cached one — an upsert/remove since the scan is still reflected).
+    if (gHaveLastDiscover)
+    {
+        auto elapsed = std::chrono::steady_clock::now() - gLastDiscoverDone;
+        if (elapsed < kDiscoverDebounceSecs)
+        {
+            out.ok       = true;
+            out.status   = "ok";
+            out.found    = gLastDiscoverResult.found;
+            out.added    = 0;
+            out.endpoint = static_cast<int>(gBridgedCameras.size()); // total bridged now (result.cameras)
+            ChipLogProgress(Camera, "CameraBridge: discover debounced (last scan %us ago) -> found=%d cameras=%zu",
+                            static_cast<unsigned>(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()),
+                            gLastDiscoverResult.found, gBridgedCameras.size());
+            return out;
+        }
+    }
 
     // Snapshot the currently-bridged cameras so RunDiscovery can match known cameras
     // by stable id; the live truth (gBridgedCameras) is mutated by AddCamera/Remove.
@@ -1145,6 +1204,13 @@ BridgeIpc::OpResult HandleIpcDiscover()
         ChipLogError(Camera, "CameraBridge: discover scan failed (rc=%d)", dr.found);
         return out;
     }
+
+    // Completed scan: cache the outcome for the debounce window above. Failed scans
+    // (found < 0, early return) are deliberately NOT cached so a transient failure can
+    // be retried immediately.
+    gLastDiscoverResult = dr;
+    gLastDiscoverDone   = std::chrono::steady_clock::now();
+    gHaveLastDiscover   = true;
 
     if (dr.added > 0 || dr.updated > 0)
         PersistCameras();
@@ -1318,7 +1384,7 @@ void ApplicationInit()
     // ------------------------------------------------------------------
     BridgeIpc::Callbacks ipcCallbacks;
     ipcCallbacks.upsert = [](const BridgeIpc::UpsertRequest & req) { return HandleIpcUpsert(req); };
-    ipcCallbacks.remove = [](const std::string & dni) { return HandleIpcRemove(dni); };
+    ipcCallbacks.remove = [](const std::string & dni, int endpoint) { return HandleIpcRemove(dni, endpoint); };
     ipcCallbacks.count  = []() -> size_t { return gCameraCount.load(); };
     ipcCallbacks.setDefaultCreds =
         [](const std::string & u, const std::string & p) { return HandleSetDefaultCreds(u, p); };

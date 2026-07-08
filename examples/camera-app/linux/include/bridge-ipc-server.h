@@ -71,7 +71,11 @@ struct OpResult
 struct Callbacks
 {
     std::function<OpResult(const UpsertRequest &)> upsert;
-    std::function<OpResult(const std::string & dni)> remove;
+    // remove: dni is the stable id when the client knows it; endpoint (>0) is an
+    // alternative key for clients that cannot read the child's Matter UniqueID
+    // (hub-core does not forward driver reads of BridgedDeviceBasicInformation,
+    // so the Edge driver only reliably knows the endpoint at delete time).
+    std::function<OpResult(const std::string & dni, int endpoint)> remove;
     std::function<size_t()> count; // current camera count, for `ping`
     // [single_bridge] set one default ONVIF login applied to every camera.
     std::function<OpResult(const std::string & userid, const std::string & password)> setDefaultCreds;
