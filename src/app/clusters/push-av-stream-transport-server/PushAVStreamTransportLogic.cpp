@@ -1887,6 +1887,25 @@ CHIP_ERROR PushAvStreamTransportServerLogic::StoreCurrentConnections()
     return CHIP_NO_ERROR;
 }
 
+CHIP_ERROR PushAvStreamTransportServerLogic::DeletePersistedConnections()
+{
+    // Drop the in-memory list first so nothing can re-run StoreCurrentConnections() and
+    // resurrect the persisted blob after it is deleted below.
+    mCurrentConnections.clear();
+
+    auto path      = ConcreteAttributePath(mEndpointId, PushAvStreamTransport::Id, CurrentConnections::Id);
+    CHIP_ERROR err = GetSafeAttributePersistenceProvider()->SafeDeleteValue(path);
+    if (err == CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND)
+    {
+        return CHIP_NO_ERROR; // nothing was persisted — already clean
+    }
+    if (err == CHIP_NO_ERROR)
+    {
+        ChipLogProgress(Zcl, "Deleted persisted CurrentConnections for endpoint %u", mEndpointId);
+    }
+    return err;
+}
+
 CHIP_ERROR PushAvStreamTransportServerLogic::LoadCurrentConnections()
 {
     Platform::ScopedMemoryBuffer<uint8_t> currentConns;

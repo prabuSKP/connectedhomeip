@@ -185,8 +185,13 @@ public:
      * Signals the worker thread to stop, finalizes the current clip,
      * and cleans up all recording resources. Waits for the worker thread
      * to complete before returning.
+     *
+     * @param aNotifyTransport When true (normal end-of-clip), dispatch an async
+     *        NotifyTransportStopped to the PushAV cluster server on this recorder's endpoint.
+     *        MUST be false on teardown paths (the destructor): during camera removal the
+     *        cluster server is destroyed BEFORE the recorder, so no notifier may be spawned.
      */
-    void Stop();
+    void Stop(bool aNotifyTransport = true);
     /// @}
 
     /**
@@ -207,10 +212,17 @@ public:
     /**
      * @brief Sets the PushAV stream transport server reference for direct API calls
      * @param server Pointer to the PushAV stream transport server instance
+     *
+     * Also captures the server's endpoint id: async notifications (Stop()'s
+     * NotifyTransportStopped thread) capture ONLY the endpoint id and re-resolve the live
+     * cluster instance from the registry under the Chip stack lock at run time, so a server
+     * destroyed by camera removal after the thread is spawned is simply not found (no-op)
+     * instead of being dereferenced as a dangling pointer.
      */
     void SetPushAvStreamTransportServer(chip::app::Clusters::PushAvStreamTransportServer * server)
     {
         mPushAvStreamTransportServer = server;
+        mEndpointId                  = (server != nullptr) ? server->GetLogic().mEndpointId : chip::kInvalidEndpointId;
     }
 
     /**
@@ -290,6 +302,9 @@ private:
     uint16_t mConnectionID                                                          = 0;
     chip::FabricIndex mFabricIndex                                                  = 0;
     chip::app::Clusters::PushAvStreamTransportServer * mPushAvStreamTransportServer = nullptr;
+    // Endpoint the cluster server lives on — the only thing async notifiers may capture
+    // (they re-resolve the server from the registry under the stack lock; see Stop()).
+    chip::EndpointId mEndpointId = chip::kInvalidEndpointId;
     chip::app::Clusters::PushAvStreamTransport::TransportTriggerTypeEnum mTriggerType;
     chip ::Optional<chip::app::Clusters::PushAvStreamTransport::TriggerActivationReasonEnum> mReasonType;
     std::filesystem::path mUploadFileBasePath;

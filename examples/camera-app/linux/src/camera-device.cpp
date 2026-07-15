@@ -472,6 +472,14 @@ CameraDevice::CameraDevice()
 
 CameraDevice::~CameraDevice()
 {
+    // Tear down the PushAV transports while every member is still alive. Members destruct in
+    // reverse declaration order, so mMediaController (declared after the managers) is destroyed
+    // FIRST — if the manager's destructor were left to do this unregister loop itself, the
+    // DefaultMediaController vtable would already have rolled back to the abstract base and
+    // UnregisterTransport() would be a pure-virtual call -> abort (crashed camera removes on
+    // hardware once bridged-camera PushAV recording started populating the transport map).
+    mPushAVTransportManager.Shutdown();
+
     if (videoDeviceFd != -1)
     {
         close(videoDeviceFd);

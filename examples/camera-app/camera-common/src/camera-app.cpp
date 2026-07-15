@@ -380,6 +380,17 @@ void CameraApp::InitCameraDeviceClusters()
     TEMPORARY_RETURN_IGNORED mZoneMgmtServerPtr->Init();
 }
 
+void CameraApp::DeletePersistedPushAvTransports()
+{
+    // Only meaningful when WE own the PushAV instance (bridge dynamic endpoint). The standalone
+    // camera-app's instance is owned by CodegenIntegration on a fixed endpoint that is never
+    // removed at runtime, so there is nothing stale to purge there.
+    if (mPushAvStreamTransportServer.IsConstructed())
+    {
+        LogErrorOnFailure(mPushAvStreamTransportServer.Cluster().GetLogic().DeletePersistedConnections());
+    }
+}
+
 void CameraApp::ShutdownCameraDeviceClusters()
 {
     ChipLogDetail(Camera, "CameraAppShutdown: Shutting down Camera device clusters");

@@ -32,7 +32,7 @@ using namespace chip::app::Clusters;
 using namespace chip::app::Clusters::PushAvStreamTransport;
 using chip::Protocols::InteractionModel::Status;
 
-PushAvStreamTransportManager::~PushAvStreamTransportManager()
+void PushAvStreamTransportManager::Shutdown()
 {
     // Unregister all transports from Media Controller before deleting them. This will ensure that any ongoing streams are
     // stopped.
@@ -42,9 +42,22 @@ PushAvStreamTransportManager::~PushAvStreamTransportManager()
         {
             mMediaController->UnregisterTransport(kv.second.get());
         }
+        mMediaController = nullptr;
     }
     mTransportMap.clear();
     mTransportOptionsMap.clear();
+}
+
+PushAvStreamTransportManager::~PushAvStreamTransportManager()
+{
+    // CameraDevice's destructor calls Shutdown() explicitly BEFORE its members destruct, so by
+    // the time this runs the maps are empty and mMediaController is null — this is a no-op
+    // safety net. It must stay that way: as a CameraDevice member this manager is declared
+    // before DefaultMediaController, so members destruct in reverse order and the controller's
+    // derived destructor has ALREADY run when this destructor executes — its vtable has rolled
+    // back to the abstract MediaController base, and calling UnregisterTransport() from here is
+    // a pure-virtual call -> std::terminate (SIGABRT seen on camera remove on hardware).
+    Shutdown();
 }
 
 void PushAvStreamTransportManager::Init()

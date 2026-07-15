@@ -160,6 +160,20 @@ public:
         }
     }
 
+    // Purge this camera's persisted PushAV transports (CurrentConnections + the upload cert
+    // reference they carry) so nothing is restored at next boot onto whichever camera then
+    // occupies this endpoint id. RUNTIME REMOVE ONLY — ApplicationShutdown must never call
+    // this: persisted transports are deliberately restored across reboots. Call before
+    // Shutdown() (it needs the live cluster) and under StackLock (KVS access is serialised
+    // with the Matter thread).
+    void DeletePersistedPushAvTransports()
+    {
+        if (mCameraApp)
+        {
+            mCameraApp->DeletePersistedPushAvTransports();
+        }
+    }
+
     // The full source+resolved record, kept so we can persist cameras.json and
     // look the camera up by its stable DNI for remove/replace.
     void SetEntry(const CameraConfig::CameraEntry & e) { mEntry = e; }
@@ -302,6 +316,8 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
 {
     std::string chosenUrl;
     std::string streamKind;
+    std::string authNote; // auth_note of the last main-stream probe — the one whose rc we return
+                          // (non-empty only when that probe returned RTSP_PROBE_AUTH)
 
     // Probe a main/sub URL pair: main first; if main is H.265 (our pipeline is
     // H.264-only passthrough) try the substream, which is commonly H.264.
@@ -311,6 +327,7 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
         chosenUrl  = mainUrl;
         streamKind = "mainstream";
         codecOut   = res.codec;
+        authNote   = res.auth_note;
         if (rc == RTSP_PROBE_NO_H264 && std::string(res.codec) == "H265")
         {
             ChipLogProgress(Camera, "CameraBridge: %s main stream is H.265 — trying substream", ip.c_str());
@@ -347,7 +364,12 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
     {
         // NO_H264 covers two distinct probe outcomes, told apart by the codec field:
         // "H265" = a stream exists but is H.265; "" = the camera returned no video stream at all.
-        const char * why = rc == RTSP_PROBE_AUTH          ? "auth_failed (check default credentials)"
+        // AUTH with a non-empty auth_note means no credential was ever sent (the 401
+        // challenge offered no scheme we implement, e.g. Digest SHA-256 only) — surface
+        // the note instead of blaming the credentials.
+        std::string authWhy = authNote.empty() ? std::string("auth_failed (check default credentials)")
+                                               : "auth_failed: " + authNote;
+        const char * why = rc == RTSP_PROBE_AUTH          ? authWhy.c_str()
             : rc == RTSP_PROBE_UNREACHABLE                ? "unreachable"
             : rc == RTSP_PROBE_BAD_PATH                   ? "bad_path (no known Hikvision RTSP scheme answered)"
             : rc == RTSP_PROBE_NO_H264 && codecOut == "H265"
@@ -483,12 +505,20 @@ int AddCamera(const CameraConfig::CameraEntry & entry)
 // Remove the bridged camera with this DNI: clear its dynamic endpoint and tear
 // down its backend. Returns true if a matching camera was found.
 //
+// purgePersistedTransports: pass true ONLY when the camera is being permanently deleted
+// (the `remove_camera` IPC op) — it wipes the endpoint's persisted PushAV transports so
+// nothing stale is restored at next boot. Every replace flow (upsert re-onboard,
+// set_default_creds re-resolve, discovery in-place rebuild) MUST pass false: the camera
+// still exists afterwards and the controller does NOT re-send AllocatePushTransport after
+// a reboot (transports are restore-designed) — purging there would silently break a
+// still-present camera's provisioned recording.
+//
 // Called from the IPC accept thread, which does not hold the Matter stack lock,
 // so the ember/registry mutations run under StackLock — the same foreign-thread
 // pattern bridge-app uses in RemoveDeviceEndpoint. (Do NOT route this through
 // PlatformMgr().ScheduleWork(): the POSIX event loop dispatches scheduled work
 // with the non-recursive stack mutex already held, so StackLock would deadlock.)
-bool RemoveCameraByDni(const std::string & dni)
+bool RemoveCameraByDni(const std::string & dni, bool purgePersistedTransports)
 {
     if (dni.empty())
         return false;
@@ -501,6 +531,16 @@ bool RemoveCameraByDni(const std::string & dni)
         BridgedCamera * cam = it->get();
         {
             StackLock lock;
+            // On true removal, delete the camera's persisted PushAV transports FIRST, before
+            // any teardown step that could crash or be interrupted. A remove that dies later
+            // can then never leave a stale transport — carrying this (deleted) camera's upload
+            // client cert — to be restored at next boot on a reused endpoint id (seen on
+            // hardware: every clip PUT through the resurrected transport got 403, cert CN !=
+            // clip owner).
+            if (purgePersistedTransports)
+            {
+                cam->DeletePersistedPushAvTransports();
+            }
             for (uint8_t i = 1; i < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++i)
             {
                 if (gDevices[i] == cam)
@@ -649,7 +689,7 @@ DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool 
     // identity merge just migrated it (e.g. hik-serial-… → onvif-mac-…) — the live
     // endpoint is still keyed on the old one.
     auto rebuildLive = [](const std::string & oldDni, const CameraConfig::CameraEntry & entry) {
-        RemoveCameraByDni(oldDni);
+        RemoveCameraByDni(oldDni, /* purgePersistedTransports = */ false); // replace, camera stays
         if (AddCamera(entry) < 0)
             ChipLogError(Camera, "CameraBridge: discover failed to rebuild endpoint for %s", entry.dni.c_str());
     };
@@ -937,7 +977,7 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
             int prc = TryDirectRtsp(host, req.name, req.userid, req.password, sid, entry, codec);
             if (prc == RTSP_PROBE_OK)
             {
-                RemoveCameraByDni(sid); // idempotent re-onboard
+                RemoveCameraByDni(sid, /* purgePersistedTransports = */ false); // idempotent re-onboard (replace, camera stays)
                 int endpoint = AddCamera(entry);
                 if (endpoint < 0)
                 {
@@ -1007,7 +1047,7 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.onvif.pass        = req.password;
 
     // Replace any existing camera with the same stable identity (idempotent re-onboard).
-    RemoveCameraByDni(sid);
+    RemoveCameraByDni(sid, /* purgePersistedTransports = */ false); // replace, camera stays
 
     int endpoint = AddCamera(entry);
     if (endpoint < 0)
@@ -1055,7 +1095,13 @@ BridgeIpc::OpResult HandleIpcRemove(const std::string & dni, int endpoint)
                             endpoint);
     }
     if (!target.empty())
-        RemoveCameraByDni(target); // idempotent: a not-found camera is already "removed"
+        // TRUE removal (the only purging caller): also wipe this endpoint's persisted PushAV
+        // transports so the deleted camera's upload cert can't be restored at next boot.
+        // Accepted trade-off: a REPLACE that lands on a different endpoint id still orphans
+        // the old endpoint's blob (pre-existing endpoint-id keying hazard) — single-camera
+        // rigs reuse the same id so restore stays coherent, and the orphan is bounded by this
+        // same-id purge on true removals.
+        RemoveCameraByDni(target, /* purgePersistedTransports = */ true); // idempotent: a not-found camera is already "removed"
     PersistCameras();
     out.ok     = true;
     out.status = "removed";
@@ -1116,7 +1162,7 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
         ne.onvif.token       = res.token;
         ne.onvif.user        = u;
         ne.onvif.pass        = p;
-        RemoveCameraByDni(s.dni);
+        RemoveCameraByDni(s.dni, /* purgePersistedTransports = */ false); // re-resolve, camera stays
         if (AddCamera(ne) >= 0)
         {
             applied++;

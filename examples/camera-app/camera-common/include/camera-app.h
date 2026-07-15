@@ -42,6 +42,13 @@ public:
     // Shutdown all the camera device clusters
     void ShutdownCameraDeviceClusters();
 
+    // Delete this endpoint's persisted PushAV transports (CurrentConnections) from storage.
+    // Bridge-only, for permanent camera removal: without this, a removed camera's transports —
+    // carrying its upload client cert — are restored at next boot onto whichever camera then
+    // occupies the endpoint id. Must NOT be called at ordinary process shutdown (persisted
+    // transports are deliberately restored across reboots).
+    void DeletePersistedPushAvTransports();
+
 private:
     chip::EndpointId mEndpoint;
     CameraDeviceInterface * mCameraDevice;

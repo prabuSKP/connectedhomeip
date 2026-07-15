@@ -53,6 +53,14 @@ public:
     ~PushAvStreamTransportManager();
 
     void Init();
+
+    // Explicit teardown: unregister every transport from the MediaController, destroy them,
+    // and drop the MediaController reference. Idempotent. MUST be called while the owning
+    // CameraDevice's DefaultMediaController is still alive (CameraDevice's destructor calls
+    // it before member destruction) — see ~PushAvStreamTransportManager for why the
+    // destructor cannot be relied on to do this.
+    void Shutdown();
+
     void SetMediaController(MediaController * mediaController);
     void SetCameraDevice(CameraDeviceInterface * cameraDevice);
     void SetPushAvStreamTransportServer(PushAvStreamTransportServer * server) override;

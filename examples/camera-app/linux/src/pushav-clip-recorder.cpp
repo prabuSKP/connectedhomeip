@@ -18,6 +18,7 @@
 
 #include "pushav-clip-recorder.h"
 #include <cstring>
+#include <data-model-providers/codegen/CodegenDataModelProvider.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -100,7 +101,12 @@ PushAVClipRecorder::~PushAVClipRecorder()
 {
     ChipLogDetail(Camera, "PushAVClipRecorder destructor called for sessionID: %" PRIu64 " Track name: %s",
                   mClipInfo.mSessionNumber, mClipInfo.mTrackName.c_str());
-    Stop();
+    // Teardown: do NOT spawn the NotifyTransportStopped thread. In the camera-remove path the
+    // PushAV cluster server is destroyed (CameraApp::ShutdownCameraDeviceClusters, under the
+    // stack lock) BEFORE this recorder (destroyed via ~CameraDevice -> manager Shutdown()) —
+    // the server this clip belongs to is going away with the camera, so there is nothing left
+    // to notify.
+    Stop(/* aNotifyTransport = */ false);
     if (mWorkerThread.joinable())
     {
         mWorkerThread.join();
@@ -362,31 +368,52 @@ void PushAVClipRecorder::Start()
                     mClipInfo.mTrackName.c_str());
 }
 
-void PushAVClipRecorder::Stop()
+void PushAVClipRecorder::Stop(bool aNotifyTransport)
 {
     if (GetRecorderStatus())
     {
-        // Call the cluster server's NotifyTransportStopped method asynchronously to prevent blocking
-        if (mPushAvStreamTransportServer != nullptr)
+        // Call the cluster server's NotifyTransportStopped method asynchronously to prevent blocking.
+        //
+        // LIFETIME: the detached thread must NOT capture the raw server pointer — a camera remove
+        // (IPC thread) can destroy the server between spawn and run (or while this thread blocks
+        // on LockChipStack). Capture the endpoint id instead and re-resolve the live instance
+        // from the cluster registry under the stack lock: register/unregister happen under that
+        // same lock, so a destroyed server is guaranteed unreachable (lookup returns null) by the
+        // time this thread acquires it. The thread holds no other lock and is never joined, so
+        // taking LockChipStack here cannot deadlock against the removing thread.
+        if (aNotifyTransport && mEndpointId != chip::kInvalidEndpointId)
         {
             ChipLogProgress(Camera, "PushAVClipRecorder::Stop - Scheduling async cluster server API call for connection %u",
                             mConnectionID);
 
-            uint16_t connectionID = mConnectionID;
-            auto triggerType      = mTriggerType;
-            auto * server         = mPushAvStreamTransportServer;
+            uint16_t connectionID       = mConnectionID;
+            auto triggerType            = mTriggerType;
+            chip::EndpointId endpointId = mEndpointId;
 
-            std::thread([server, connectionID, triggerType]() {
+            std::thread([endpointId, connectionID, triggerType]() {
                 ChipLogProgress(Camera, "Async thread: Calling NotifyTransportStopped for connection %u", connectionID);
                 chip::DeviceLayer::PlatformMgr().LockChipStack();
-                server->NotifyTransportStopped(connectionID, triggerType);
+                auto * cluster = chip::app::CodegenDataModelProvider::Instance().Registry().Get(
+                    { endpointId, chip::app::Clusters::PushAvStreamTransport::Id });
+                if (cluster != nullptr)
+                {
+                    static_cast<chip::app::Clusters::PushAvStreamTransportServer *>(cluster)->NotifyTransportStopped(connectionID,
+                                                                                                                     triggerType);
+                }
+                else
+                {
+                    ChipLogProgress(Camera,
+                                    "Async thread: PushAV cluster on endpoint %u is gone (camera removed) — "
+                                    "skipping NotifyTransportStopped for connection %u",
+                                    endpointId, connectionID);
+                }
                 chip::DeviceLayer::PlatformMgr().UnlockChipStack();
                 ChipLogProgress(Camera, "Async thread: NotifyTransportStopped completed for connection %u", connectionID);
             }).detach();
         }
-        else
+        else if (aNotifyTransport)
         {
-            ChipLogError(Camera, "PushAVClipRecorder::Stop - Cluster server reference is null for connection %u", mConnectionID);
+            ChipLogError(Camera, "PushAVClipRecorder::Stop - Cluster server endpoint is unknown for connection %u", mConnectionID);
         }
 
         SetRecorderStatus(false);

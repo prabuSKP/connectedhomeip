@@ -102,6 +102,14 @@ public:
 
     void Shutdown();
 
+    /**
+     * Drops all transport connections AND deletes the persisted CurrentConnections blob for
+     * this endpoint from storage, so nothing is restored at next boot. For use when the
+     * endpoint itself is being permanently removed (e.g. a bridged camera is deleted) —
+     * NOT at ordinary shutdown, where persisted transports must survive to be restored.
+     */
+    CHIP_ERROR DeletePersistedConnections();
+
     bool HasFeature(PushAvStreamTransport::Feature feature) const;
 
     Protocols::InteractionModel::Status ValidateIncomingTransportOptions(
