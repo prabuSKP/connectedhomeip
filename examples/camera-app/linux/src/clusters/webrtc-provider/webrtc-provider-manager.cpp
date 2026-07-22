@@ -300,8 +300,11 @@ CHIP_ERROR WebRTCProviderManager::HandleSolicitOffer(const OfferRequestArgs & ar
     }
 
     transport->Start();
-    transport->AddAudioTrack();
     transport->AddVideoTrack();
+    if (!audioStreams.empty())
+    {
+        transport->AddAudioTrack();
+    }
 
     // Acquire the Video and Audio Streams from the CameraAVStreamManagement
     // cluster and update the reference counts.
@@ -514,7 +517,10 @@ CHIP_ERROR WebRTCProviderManager::HandleProvideOffer(const ProvideOfferRequestAr
     ChipLogProgress(Camera, "Extracted videoMid: %s, payloadType: %d", videoMid.c_str(), videoPt);
 
     transport->AddVideoTrack(videoMid, videoPt);
-    transport->AddAudioTrack(audioMid, audioPt);
+    if (!audioStreams.empty())
+    {
+        transport->AddAudioTrack(audioMid, audioPt);
+    }
 
     // Acquire the Video and Audio Streams from the CameraAVStreamManagement
     // cluster and update the reference counts.

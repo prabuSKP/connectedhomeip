@@ -62,6 +62,8 @@ struct OpResult
     std::string videoCodec;
     bool hasPtz       = false;
     bool hasAudioOut  = false;
+    bool hasAudioIn   = false;
+    std::string audioCodec;
     // discover success payload (`endpoint` doubles as the total bridged-camera
     // count here, mirroring how set_default_creds reports `result.cameras`):
     int found = 0; // ONVIF responders returned by this WS-Discovery scan

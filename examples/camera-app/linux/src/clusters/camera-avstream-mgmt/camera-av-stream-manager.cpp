@@ -816,6 +816,12 @@ CameraAVStreamManager::AllocatedAudioStreamsLoaded()
     const std::vector<AudioStreamStruct> & persistedStreams = GetCameraAVStreamManagementCluster()->GetAllocatedAudioStreams();
     auto & halStreams                                       = mCameraDeviceHAL->GetCameraHALInterface().GetAvailableAudioStreams();
 
+    if (halStreams.empty() && !persistedStreams.empty())
+    {
+        ChipLogProgress(Camera, "CAM_AUDIO unavailable reason=capability_changed");
+        return CHIP_NO_ERROR;
+    }
+
     for (auto & halStream : halStreams)
     {
         auto it = std::find_if(persistedStreams.begin(), persistedStreams.end(), [&](const AudioStreamStruct & persistedStream) {

@@ -21,6 +21,7 @@
 #include <AppMain.h>
 #include <Options.h>
 #include <chrono>
+#include <cstring> // memcpy/memset for the padded JPEG decode buffer
 #include <fcntl.h> // For file descriptor operations
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,7 @@
 #include <thread>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
+#include <gst/rtsp/rtsp.h> // GstRTSPMessage header edit for the Hikvision Basic-auth override
 #include <iostream>
 #include <lib/support/logging/CHIPLogging.h>
 #include <limits.h>          // For PATH_MAX
@@ -115,18 +117,18 @@ GstFlowReturn OnNewVideoSampleFromAppSink(GstAppSink * appsink, gpointer user_da
                 rawPts = 0;
             }
         }
-        auto firstPtsIt = self->mVideoStreamPtsOffsetMs.find(videoStreamID);
-        if (firstPtsIt == self->mVideoStreamPtsOffsetMs.end())
-        {
-            auto now                                     = std::chrono::steady_clock::now().time_since_epoch();
-            int64_t nowMs                                = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-            int64_t rawMs                                = static_cast<int64_t>(rawPts / 1000000);
-            self->mVideoStreamPtsOffsetMs[videoStreamID] = nowMs - rawMs;
-        }
-        int64_t ts = self->mVideoStreamPtsOffsetMs[videoStreamID] + (rawPts / 1000000);
-        if (ts >= self->mVideoStreamPtsOffsetMs[videoStreamID])
-        {
 
+        // Watchdog bookkeeping + PTS-offset lookup share mWatchdogMutex (F1): the PTS map is
+        // erased by the watchdog thread's TearDownVideoPipeline on restart, so it must not be
+        // touched here without the lock. HandleVideoBufferTimestamp does both under that lock;
+        // DistributeVideo is done AFTER it returns (it is heavy and must not stall the
+        // watchdog thread).
+        int64_t ts         = 0;
+        int64_t firstPts   = 0;
+        bool forwardFrame  = self->HandleVideoBufferTimestamp(videoStreamID, rawPts, ts, firstPts);
+
+        if (forwardFrame)
+        {
             // Forward raw H.264 encoded frames to media controller with timestamp
             // The PreRollBuffer will distribute to ALL transports registered for this videoStreamID
             // Each transport will handle its own SFrame encryption (if configured) during RTP packetization
@@ -135,8 +137,8 @@ GstFlowReturn OnNewVideoSampleFromAppSink(GstAppSink * appsink, gpointer user_da
         else
         {
             ChipLogError(Camera,
-                         "Dropping video frame with PTS %" G_GUINT64_FORMAT " <= first PTS %" G_GUINT64_FORMAT " for stream %u",
-                         rawPts, self->mVideoStreamPtsOffsetMs[videoStreamID], videoStreamID);
+                         "Dropping video frame with PTS %" G_GUINT64_FORMAT " <= first PTS %" G_GINT64_FORMAT " for stream %u",
+                         rawPts, firstPts, videoStreamID);
         }
 
         // Cache the latest keyframe (h264parse config-interval=-1 keeps SPS/PPS inline, so it is
@@ -472,6 +474,10 @@ CameraDevice::CameraDevice()
 
 CameraDevice::~CameraDevice()
 {
+    // No-op if Shutdown() already ran: make sure the watchdog thread is joined before any
+    // member it touches (pipelines, media controller) is destroyed.
+    StopWatchdog();
+
     // Tear down the PushAV transports while every member is still alive. Members destruct in
     // reverse declaration order, so mMediaController (declared after the managers) is destroyed
     // FIRST — if the manager's destructor were left to do this unregister loop itself, the
@@ -492,10 +498,27 @@ void CameraDevice::Init()
     InitializeStreams();
     mWebRTCProviderManager.Init();
     mPushAVTransportManager.Init();
+
+    // Warm the snapshot cache at endpoint creation. Both onboarding paths funnel through here
+    // (boot-time cameras.json load and runtime IPC AddCamera both call BridgedCamera::
+    // InitClusters -> Init(), the single-camera CLI path calls Init() from main.cpp), so the
+    // FIRST CaptureSnapshot no longer fails with "not ready yet" while the initial ONVIF fetch
+    // is still in flight. onvifOnly=true keeps this to just the lightweight ONVIF curl — no
+    // RTSP session or H.264 decode at boot (F4). Detached/non-blocking, so it never delays
+    // endpoint bring-up, and harmless when the camera is unreachable (curl timeout is bounded).
+    // Only worth doing when the camera actually has an ONVIF snapshot URI; RTSP-only cameras
+    // warm lazily on the first CaptureSnapshot.
+    if (!mOnvifConfig.snapshotUrl.empty())
+    {
+        TriggerSnapshotRefresh(/*onvifOnly=*/true);
+    }
 }
 
 void CameraDevice::Shutdown()
 {
+    // Stop the RTSP watchdog first so it cannot rebuild a pipeline under the teardown below.
+    StopWatchdog();
+
     // Close WebRTC connections while the SystemLayer is still alive, so that WebRTC callbacks can safely use ScheduleLambda.
     mWebRTCProviderManager.CloseConnection();
 
@@ -579,46 +602,96 @@ GstElement * CameraDevice::CreateSnapshotPipeline(const std::string & device, in
     return nullptr; // Here to avoid compiler warnings, should never reach this point.
 }
 
-// ONVIF bridge: rtspsrc exposes its stream pads dynamically once the RTSP session is
-// negotiated, so rtspsrc → rtph264depay is linked at "pad-added" time. Only the H.264
-// video pad is linked; audio/other pads are ignored.
-static void OnvifLinkRtspPad(GstElement * src, GstPad * newPad, gpointer user_data)
+struct OnvifPadLinkContext {
+    GstElement * videoDepay = nullptr;
+    GstElement * audioDepay = nullptr;
+    CameraDevice * device   = nullptr;
+};
+
+// [hikvision] Some Hikvision cameras (verified: DS-2CD122P-I3) have a broken RTSP
+// Digest implementation — they reject the CORRECT password over Digest but accept
+// the SAME credentials over Basic. Our onvif_rtsp_probe already detects this and
+// falls back to Basic (setting OnvifConfig::needsBasicAuth at onboarding), but
+// GStreamer's rtspsrc has no such fallback: it tries Digest, gets 401, and gives up
+// with "Unauthorized" even though the password is right. For a flagged camera we hook
+// rtspsrc's "before-send" signal and force a Basic Authorization header on every
+// outgoing RTSP request, so the broken Digest exchange is bypassed entirely. The
+// signal hands us the request message with G_SIGNAL_TYPE_STATIC_SCOPE (modifiable in
+// place); returning TRUE sends it (FALSE would drop it).
+struct RtspForceBasicContext {
+    std::string authHeader; // full field value: "Basic <base64(user:pass)>"
+};
+
+static gboolean OnvifForceBasicAuth(GstElement * /*src*/, GstRTSPMessage * msg, gpointer user_data)
 {
-    GstElement * depay = static_cast<GstElement *>(user_data);
-    GstPad * sinkPad   = gst_element_get_static_pad(depay, "sink");
-    if (sinkPad == nullptr || gst_pad_is_linked(sinkPad))
+    auto * ctx = static_cast<RtspForceBasicContext *>(user_data);
+    if (ctx && msg && gst_rtsp_message_get_type(msg) == GST_RTSP_MESSAGE_REQUEST)
     {
-        if (sinkPad)
+        // Drop any Authorization header rtspsrc may have set (e.g. a Digest response
+        // to a 401) and replace it with our precomputed Basic header. indx -1 removes
+        // every existing instance; a no-op if none are present.
+        gst_rtsp_message_remove_header(msg, GST_RTSP_HDR_AUTHORIZATION, -1);
+        gst_rtsp_message_add_header(msg, GST_RTSP_HDR_AUTHORIZATION, ctx->authHeader.c_str());
+    }
+    return TRUE; // always send the request
+}
+
+// ONVIF bridge: rtspsrc exposes its stream pads dynamically once the RTSP session is
+// negotiated, so rtspsrc → depay is linked at "pad-added" time.
+static void OnvifLinkRtspPadAV(GstElement * src, GstPad * newPad, gpointer user_data)
+{
+    OnvifPadLinkContext * ctx = static_cast<OnvifPadLinkContext *>(user_data);
+    GstCaps * caps            = gst_pad_get_current_caps(newPad);
+    const GstStructure * st   = caps ? gst_caps_get_structure(caps, 0) : nullptr;
+    const gchar * media       = st ? gst_structure_get_string(st, "media") : nullptr;
+    const gchar * encoding    = st ? gst_structure_get_string(st, "encoding-name") : nullptr;
+
+    if (media && g_strcmp0(media, "video") == 0)
+    {
+        if (g_strcmp0(encoding, "H264") == 0 && ctx->videoDepay)
         {
-            gst_object_unref(sinkPad);
+            GstPad * sinkPad = gst_element_get_static_pad(ctx->videoDepay, "sink");
+            if (sinkPad && !gst_pad_is_linked(sinkPad))
+            {
+                if (gst_pad_link(newPad, sinkPad) == GST_PAD_LINK_OK)
+                {
+                    ChipLogProgress(Camera, "ONVIF: linked rtspsrc video pad → rtph264depay");
+                }
+                else
+                {
+                    ChipLogError(Camera, "ONVIF: failed to link video pad");
+                }
+            }
+            if (sinkPad)
+                gst_object_unref(sinkPad);
         }
-        return;
+    }
+    else if (media && g_strcmp0(media, "audio") == 0)
+    {
+        if (ctx->audioDepay)
+        {
+            GstPad * sinkPad = gst_element_get_static_pad(ctx->audioDepay, "sink");
+            if (sinkPad && !gst_pad_is_linked(sinkPad))
+            {
+                if (gst_pad_link(newPad, sinkPad) == GST_PAD_LINK_OK)
+                {
+                    ctx->device->SetAudioBranchLinked(true);
+                    ChipLogProgress(Camera, "CAM_AUDIO branch-linked media=audio codec=%s", encoding ? encoding : "unknown");
+                }
+                else
+                {
+                    ChipLogError(Camera, "ONVIF: failed to link audio pad");
+                }
+            }
+            if (sinkPad)
+                gst_object_unref(sinkPad);
+        }
     }
 
-    // Link only the H.264 video application pad.
-    GstCaps * caps           = gst_pad_get_current_caps(newPad);
-    const GstStructure * st  = caps ? gst_caps_get_structure(caps, 0) : nullptr;
-    const gchar * media      = st ? gst_structure_get_string(st, "media") : nullptr;
-    const gchar * encoding   = st ? gst_structure_get_string(st, "encoding-name") : nullptr;
-    const bool isVideoH264   = (media == nullptr || g_strcmp0(media, "video") == 0) &&
-        (encoding == nullptr || g_strcmp0(encoding, "H264") == 0);
     if (caps)
     {
         gst_caps_unref(caps);
     }
-
-    if (isVideoH264)
-    {
-        if (gst_pad_link(newPad, sinkPad) != GST_PAD_LINK_OK)
-        {
-            ChipLogError(Camera, "ONVIF: failed to link rtspsrc pad → rtph264depay");
-        }
-        else
-        {
-            ChipLogProgress(Camera, "ONVIF: linked rtspsrc video pad → rtph264depay");
-        }
-    }
-    gst_object_unref(sinkPad);
 }
 
 // Helper function to create a GStreamer pipeline that captures raw video frames from
@@ -646,7 +719,7 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
         };
         if (GstreamerPipepline::isGstElementsNull(onvifElements))
         {
-            ChipLogError(Camera, "ONVIF: not all elements could be created.");
+            ChipLogError(Camera, "ONVIF: not all video elements could be created.");
             GstreamerPipepline::unrefGstElements(pipeline, source, depay, parse, h264caps, appsink);
             error = CameraError::ERROR_INIT_FAILED;
             return nullptr;
@@ -654,14 +727,26 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
 
         // rtspsrc: cap the jitterbuffer latency; let it negotiate transport (UDP→TCP fallback).
         g_object_set(source, "location", onvifUrl.c_str(), "latency", 200, nullptr);
-        // Credentials go to rtspsrc as element properties (user-id/user-pw), NOT embedded in the
-        // location URL — the URL is logged and persisted, so a "user:pass@" prefix would leak the
-        // password. rtspsrc answers the camera's Digest/Basic challenge itself. Required for
-        // cameras that enforce RTSP auth (e.g. all Hikvision), harmless for those that don't.
+        // Credentials go to rtspsrc as element properties (user-id/user-pw)
         if (!mOnvifConfig.user.empty())
             g_object_set(source, "user-id", mOnvifConfig.user.c_str(), "user-pw", mOnvifConfig.pass.c_str(), nullptr);
-        // h264parse: emit byte-stream access units and repeat SPS/PPS (config-interval=-1) so a
-        // mid-stream WebRTC viewer can start decoding immediately.
+
+        // [hikvision] For a camera whose Digest is broken (needsBasicAuth, set at
+        // onboarding from the RTSP probe's Basic fallback), force Basic auth on every
+        // request via the before-send hook — rtspsrc's own Digest attempt would 401.
+        if (mOnvifConfig.needsBasicAuth && !mOnvifConfig.user.empty())
+        {
+            std::string creds = mOnvifConfig.user + ":" + mOnvifConfig.pass;
+            gchar * b64       = g_base64_encode(reinterpret_cast<const guchar *>(creds.data()), creds.size());
+            auto * authCtx    = new RtspForceBasicContext();
+            authCtx->authHeader = std::string("Basic ") + (b64 ? b64 : "");
+            g_free(b64);
+            g_signal_connect_data(source, "before-send", G_CALLBACK(OnvifForceBasicAuth), authCtx,
+                                  [](gpointer data, GClosure *) { delete static_cast<RtspForceBasicContext *>(data); },
+                                  static_cast<GConnectFlags>(0));
+            ChipLogProgress(Camera, "ONVIF: forcing Basic RTSP auth (Digest was rejected but Basic accepted at probe time)");
+        }
+        // h264parse: emit byte-stream access units and repeat SPS/PPS
         g_object_set(parse, "config-interval", -1, nullptr);
         GstCaps * outCaps = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "byte-stream",
                                                 "alignment", G_TYPE_STRING, "au", nullptr);
@@ -669,7 +754,66 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
         gst_caps_unref(outCaps);
         g_object_set(appsink, "emit-signals", TRUE, nullptr);
 
+        // Preflight check for audio plugins
+        bool includeAudio = false;
+        GstElement * audio_queue    = nullptr;
+        GstElement * audio_depay    = nullptr;
+        GstElement * audio_dec      = nullptr;
+        GstElement * audio_convert  = nullptr;
+        GstElement * audio_resample = nullptr;
+        GstElement * audio_enc      = nullptr;
+        GstElement * audio_sink     = nullptr;
+
+        if (mOnvifConfig.HasVerifiedAudio())
+        {
+            const char * depay_plugin = (mOnvifConfig.audioCapability.codec == InboundAudioCodec::kPcmu) ? "rtppcmudepay" : "rtppcmadepay";
+            const char * dec_plugin   = (mOnvifConfig.audioCapability.codec == InboundAudioCodec::kPcmu) ? "mulawdec" : "alawdec";
+            const std::vector<const char *> requiredAudioPlugins = {
+                "queue", depay_plugin, dec_plugin, "audioconvert", "audioresample", "opusenc", "appsink"
+            };
+            bool hasAllPlugins = true;
+            for (const auto & plugin : requiredAudioPlugins) {
+                if (!gst_element_factory_find(plugin)) {
+                    ChipLogError(Camera, "CAM_AUDIO unavailable reason=missing_plugin missing=%s", plugin);
+                    hasAllPlugins = false;
+                }
+            }
+
+            if (hasAllPlugins)
+            {
+                audio_queue    = gst_element_factory_make("queue", "audio_queue");
+                audio_depay    = gst_element_factory_make(depay_plugin, "audio_depay");
+                audio_dec      = gst_element_factory_make(dec_plugin, "audio_dec");
+                audio_convert  = gst_element_factory_make("audioconvert", "audio_convert");
+                audio_resample = gst_element_factory_make("audioresample", "audio_resample");
+                audio_enc      = gst_element_factory_make("opusenc", "audio_enc");
+                audio_sink     = gst_element_factory_make("appsink", "audio_sink");
+
+                if (audio_queue && audio_depay && audio_dec && audio_convert && audio_resample && audio_enc && audio_sink)
+                {
+                    includeAudio = true;
+                }
+                else
+                {
+                    ChipLogError(Camera, "ONVIF: failed to create all audio elements despite factory presence.");
+                    GstreamerPipepline::unrefGstElements(audio_queue, audio_depay, audio_dec, audio_convert, audio_resample, audio_enc, audio_sink);
+                    audio_queue = audio_depay = audio_dec = audio_convert = audio_resample = audio_enc = audio_sink = nullptr;
+                }
+            }
+        }
+
         gst_bin_add_many(GST_BIN(pipeline), source, depay, parse, h264caps, appsink, nullptr);
+        if (includeAudio)
+        {
+            g_object_set(audio_enc, "bitrate", 20000, "complexity", 3, nullptr);
+            g_object_set(audio_sink, "emit-signals", TRUE, nullptr);
+
+            AudioAppSinkContext * aCtx = new AudioAppSinkContext{ this, 1 }; // Audio streamID is 1
+            GstAppSinkCallbacks aCallbacks = { nullptr, nullptr, OnNewAudioSampleFromAppSink };
+            gst_app_sink_set_callbacks(GST_APP_SINK(audio_sink), &aCallbacks, aCtx, DestroyAudioAppSinkContext);
+
+            gst_bin_add_many(GST_BIN(pipeline), audio_queue, audio_depay, audio_dec, audio_convert, audio_resample, audio_enc, audio_sink, nullptr);
+        }
 
         // Static chain: rtph264depay → h264parse → capsfilter → appsink.
         if (!gst_element_link_many(depay, parse, h264caps, appsink, nullptr))
@@ -679,10 +823,30 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
             error = CameraError::ERROR_INIT_FAILED;
             return nullptr;
         }
-        // rtspsrc → rtph264depay is linked dynamically (rtspsrc has sometimes-pads).
-        g_signal_connect(source, "pad-added", G_CALLBACK(OnvifLinkRtspPad), depay);
 
-        ChipLogProgress(Camera, "Video pipeline: ONVIF/RTSP source %s (H.264 passthrough)", onvifUrl.c_str());
+        if (includeAudio)
+        {
+            if (!gst_element_link_many(audio_queue, audio_depay, audio_dec, audio_convert, audio_resample, audio_enc, audio_sink, nullptr))
+            {
+                ChipLogError(Camera, "ONVIF: link audio elements failed");
+                gst_object_unref(pipeline);
+                error = CameraError::ERROR_INIT_FAILED;
+                return nullptr;
+            }
+        }
+
+        // Dynamic link setup
+        OnvifPadLinkContext * linkCtx = new OnvifPadLinkContext();
+        linkCtx->videoDepay = depay;
+        linkCtx->audioDepay = includeAudio ? audio_queue : nullptr;
+        linkCtx->device     = this;
+
+        g_signal_connect_data(source, "pad-added", G_CALLBACK(OnvifLinkRtspPadAV), linkCtx,
+                              [](gpointer data, GClosure *) { delete static_cast<OnvifPadLinkContext *>(data); },
+                              static_cast<GConnectFlags>(0));
+
+        ChipLogProgress(Camera, "Video pipeline: ONVIF/RTSP source %s (H.264 passthrough%s)", onvifUrl.c_str(),
+                        includeAudio ? " + Audio PCMU/PCMA->Opus" : "");
         return pipeline;
     }
 
@@ -768,6 +932,12 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
 GstElement * CameraDevice::CreateAudioPipeline(const std::string & device, int channels, int sampleRate, int bitRate,
                                                CameraError & error)
 {
+    if (!mOnvifConfig.rtspUrl.empty())
+    {
+        error = CameraError::ERROR_INIT_FAILED;
+        return nullptr;
+    }
+
     // Pipeline: source → capsfilter → audioconvert → audioresample → opusenc → appsink
     GstElement * pipeline = gst_pipeline_new("audio-pipeline");
     GstElement * source   = nullptr;
@@ -1008,14 +1178,18 @@ bool FetchOnvifSnapshot(const std::string & url, const std::string & user, const
     return false;
 }
 
+// Hard cap for ANY JPEG served by CaptureSnapshot, shared by all snapshot tiers (including
+// the camera-produced tier-1 ONVIF JPEG — field failures showed busy scenes pushing it past
+// the cluster limit: "Snapshot image file size(75823) exceeded limit 63802"). Stays under
+// the CaptureSnapshot image limit (63802).
+constexpr int kMaxSnapshotJpegBytes = 60000;
+
 // MJPEG-encode one decoded frame to `path` via libav. The decoded H.264 frame is YUV420P;
 // the MJPEG encoder wants YUVJ420P (identical layout, JPEG/full range) so we just relabel it.
 // The CaptureSnapshot response has a hard payload limit (~62 KB — the cluster rejects larger
-// files with RESOURCE_EXHAUSTED), so step up the compression until the JPEG fits.
+// files with cluster status FAILURE (0x01)), so step up the compression until the JPEG fits.
 bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
 {
-    constexpr int kMaxJpegBytes = 60000; // stay under the CaptureSnapshot image limit (63802)
-
     const AVCodec * enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!enc)
         return false;
@@ -1026,8 +1200,14 @@ bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
     frame->format    = AV_PIX_FMT_YUVJ420P;
     frame->pts       = 0;
 
-    for (int q = 8; q <= 31 && !ok; q += 7) // MJPEG qscale: 1 = best, 31 = smallest
+    // MJPEG qscale: 1 = best, 31 = smallest. Escalate compression until the JPEG fits the
+    // CaptureSnapshot cap; the last step MUST be the true minimum q=31 (a plain 8,15,22,29
+    // ramp stops at 29 and never tries the smallest, so a very busy full-res frame could stay
+    // over the cap even though q=31 would fit).
+    static const int kQSteps[] = { 8, 15, 22, 29, 31 };
+    for (int qi = 0; qi < static_cast<int>(sizeof(kQSteps) / sizeof(kQSteps[0])) && !ok; ++qi)
     {
+        const int q           = kQSteps[qi];
         AVCodecContext * ectx = avcodec_alloc_context3(enc);
         if (!ectx)
             break;
@@ -1045,7 +1225,7 @@ bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
             frame->quality = FF_QP2LAMBDA * q;
             if (avcodec_send_frame(ectx, frame) == 0 && avcodec_receive_packet(ectx, pkt) == 0)
             {
-                if (pkt->size <= kMaxJpegBytes)
+                if (pkt->size <= kMaxSnapshotJpegBytes)
                 {
                     std::ofstream f(path, std::ios::binary | std::ios::trunc);
                     if (f.is_open())
@@ -1056,7 +1236,8 @@ bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
                 }
                 else
                 {
-                    ChipLogProgress(Camera, "Snapshot JPEG %d bytes > %d at q=%d; recompressing", pkt->size, kMaxJpegBytes, q);
+                    ChipLogProgress(Camera, "Snapshot JPEG %d bytes > %d at q=%d; recompressing", pkt->size,
+                                    kMaxSnapshotJpegBytes, q);
                 }
             }
         }
@@ -1181,6 +1362,12 @@ void SnapshotEnd(const std::string & path)
     gSnapBusyPaths.erase(path);
 }
 
+// Process-global cap on concurrent boot-time (onvifOnly) prefetch workers. Discovery/reboot of a
+// multi-camera fleet would otherwise fan out N detached prefetch threads at once (F4); cap them so
+// the boot storm is bounded. Cameras that miss the cap warm lazily on the first CaptureSnapshot.
+std::atomic<int> gPrefetchInFlight{ 0 };
+constexpr int kMaxConcurrentPrefetch = 2;
+
 // Hybrid on-demand snapshot: ONVIF snapshot URI first (camera-produced JPEG, no local
 // decode), else decode one RTSP keyframe. Writes a JPEG to `path`.
 // Decode a single H.264 access unit (Annex-B with SPS/PPS inline) to a JPEG file via libav.
@@ -1222,26 +1409,120 @@ bool DecodeAuToJpeg(const uint8_t * au, size_t auSize, const std::string & path)
     return ok;
 }
 
+// Tier-1 oversize handling: decode a camera-produced JPEG with libav's MJPEG decoder and
+// re-encode it through the shared qscale loop so it fits kMaxSnapshotJpegBytes. This keeps
+// the camera's full-res image and needs no RTSP session, so it works even while live view is
+// active (no contention on session-limited cameras). Returns false on any decode problem —
+// the caller then falls through to tiers 2-4 exactly as if tier 1 had failed.
+bool ReencodeJpegToFit(const std::string & jpeg, const std::string & path)
+{
+    const AVCodec * dec   = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+    AVCodecContext * dctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    AVFrame * frame       = av_frame_alloc();
+    AVPacket * pkt        = av_packet_alloc();
+    bool ok               = false;
+
+    // libav decoders read past the end of the packet in SIMD paths, so the input MUST carry
+    // AV_INPUT_BUFFER_PADDING_SIZE zeroed trailing bytes. Feeding jpeg.data() directly (no
+    // padding) made the MJPEG decoder fail on a perfectly valid baseline 4:2:0 JPEG — the
+    // observed silent tier-1 failure (Blocker 2). Copy into a padded av_malloc'd buffer.
+    uint8_t * padded = static_cast<uint8_t *>(av_malloc(jpeg.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (dctx && frame && pkt && padded && avcodec_open2(dctx, dec, nullptr) == 0)
+    {
+        memcpy(padded, jpeg.data(), jpeg.size());
+        memset(padded + jpeg.size(), 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        pkt->data = padded;
+        pkt->size = static_cast<int>(jpeg.size());
+
+        bool decoded = false;
+        if (avcodec_send_packet(dctx, pkt) == 0)
+        {
+            avcodec_send_packet(dctx, nullptr); // flush so the single image is emitted
+            decoded = (avcodec_receive_frame(dctx, frame) == 0);
+        }
+
+        if (!decoded)
+        {
+            ChipLogProgress(Camera, "Snapshot: ONVIF JPEG re-encode DECODE failed (%zu bytes); falling through to next tier",
+                            jpeg.size());
+        }
+        // EncodeFrameToJpeg relabels the frame as YUVJ420P, which is only valid for 4:2:0
+        // input; treat any other subsampling (some cameras emit 4:2:2 JPEGs) as a failure so
+        // the caller falls through to tiers 2-4.
+        else if (frame->format != AV_PIX_FMT_YUVJ420P && frame->format != AV_PIX_FMT_YUV420P)
+        {
+            ChipLogProgress(Camera, "Snapshot: ONVIF JPEG pix_fmt %d is not 4:2:0; skipping re-encode", frame->format);
+        }
+        else
+        {
+            ok = EncodeFrameToJpeg(frame, path);
+            if (!ok)
+            {
+                ChipLogProgress(Camera, "Snapshot: ONVIF JPEG decoded but ENCODE-to-fit failed; falling through to next tier");
+            }
+        }
+    }
+    if (pkt)
+    {
+        pkt->data = nullptr; // points at `padded`, freed separately below
+        pkt->size = 0;
+        av_packet_free(&pkt);
+    }
+    if (padded)
+        av_free(padded);
+    av_frame_free(&frame);
+    if (dctx)
+        avcodec_free_context(&dctx);
+    return ok;
+}
+
 // Hybrid on-demand snapshot: ONVIF snapshot URI (camera-produced JPEG) first; else decode the most
 // recent LIVE keyframe (no extra RTSP session); else — only when nothing is streaming — a short
 // dedicated RTSP grab. The cached-keyframe path is what stops the thumbnail from starving this
 // session-limited camera's live view once it has streamed at least once.
 bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & cachedKeyframe, bool liveActive,
-                          bool cacheFresh, const std::string & path)
+                          bool cacheFresh, const std::string & path, bool onvifOnly = false)
 {
     std::string jpeg;
     if (FetchOnvifSnapshot(cfg.snapshotUrl, cfg.user, cfg.pass, jpeg))
     {
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (f.is_open())
+        if (jpeg.size() <= static_cast<size_t>(kMaxSnapshotJpegBytes))
         {
-            f.write(jpeg.data(), static_cast<std::streamsize>(jpeg.size()));
-            if (f.good())
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (f.is_open())
             {
-                ChipLogProgress(Camera, "Snapshot: ONVIF snapshot URI -> %s (%zu bytes)", path.c_str(), jpeg.size());
-                return true;
+                f.write(jpeg.data(), static_cast<std::streamsize>(jpeg.size()));
+                if (f.good())
+                {
+                    ChipLogProgress(Camera, "Snapshot: ONVIF snapshot URI -> %s (%zu bytes)", path.c_str(), jpeg.size());
+                    return true;
+                }
             }
         }
+        // The camera's own JPEG is over the CaptureSnapshot cap (scene-dependent: busy scenes
+        // inflate the mainstream JPEG past the cluster limit and the command fails). Never
+        // return it as-is — re-encode it locally to fit; on any decode failure fall through
+        // to tiers 2-4 exactly as if tier 1 had failed.
+        else if (ReencodeJpegToFit(jpeg, path))
+        {
+            ChipLogProgress(Camera, "Snapshot: ONVIF snapshot URI re-encoded to fit (%zu bytes > %d cap) -> %s", jpeg.size(),
+                            kMaxSnapshotJpegBytes, path.c_str());
+            return true;
+        }
+        else
+        {
+            ChipLogProgress(Camera, "Snapshot: ONVIF JPEG %zu bytes > %d cap and re-encode failed; trying next tier",
+                            jpeg.size(), kMaxSnapshotJpegBytes);
+        }
+    }
+    // Boot-time cache warm (onvifOnly): only the lightweight ONVIF curl above is allowed. Do NOT
+    // fall to the cached-keyframe / dedicated-RTSP tiers here — with a cold cache at boot those
+    // would spin up N concurrent full RTSP sessions + H.264 decodes across a fleet on the
+    // ~169 MB-free hub (F4). RTSP-only cameras (no ONVIF snapshot URI) simply warm lazily on the
+    // first CaptureSnapshot instead.
+    if (onvifOnly)
+    {
+        return false;
     }
     // While streaming (or if a viewer just did), the cached live keyframe is current — decode it and
     // never open a competing RTSP session.
@@ -1269,6 +1550,74 @@ bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & 
 }
 
 } // namespace
+
+std::string CameraDevice::SnapshotCachePath() const
+{
+    return "/tmp/onvif-bridge/snapshot_" + std::to_string(std::hash<std::string>{}(mOnvifConfig.rtspUrl)) + ".jpg";
+}
+
+// Kick one TTL-gated background snapshot refresh on a detached thread. Never blocks the
+// caller: GenerateSnapshotJpeg picks a source that never fights live view (it prefers the
+// cached live keyframe and only opens a dedicated RTSP session when nothing is streaming),
+// and every copy the worker uses is captured by value, so it is safe even if this
+// CameraDevice is destroyed while the worker runs. Called from CaptureSnapshot on every
+// request (onvifOnly=false → full tier cascade) and once from Init() to warm the cache at
+// endpoint creation (onvifOnly=true → ONLY the lightweight ONVIF curl, bounded by a global
+// concurrency cap so a fleet reboot doesn't storm the hub with RTSP sessions).
+void CameraDevice::TriggerSnapshotRefresh(bool onvifOnly)
+{
+    std::error_code snapEc;
+    std::filesystem::create_directories("/tmp/onvif-bridge", snapEc);
+    const std::string snapPath = SnapshotCachePath();
+
+    // Refresh at most once per TTL.
+    constexpr auto kSnapshotTtlSec = 10;
+    bool liveActive                = mActiveVideoStreams.load() > 0;
+    bool stale                     = true;
+    {
+        std::error_code e;
+        auto mtime = std::filesystem::last_write_time(snapPath, e);
+        if (!e)
+            stale = (std::filesystem::file_time_type::clock::now() - mtime) > std::chrono::seconds(kSnapshotTtlSec);
+    }
+    if (!(stale && TrySnapshotBegin(snapPath)))
+    {
+        return;
+    }
+
+    // Boot prefetch: honor the global concurrency cap. If we're at the cap, release the busy
+    // marker and skip — this camera warms lazily on the first CaptureSnapshot.
+    if (onvifOnly)
+    {
+        if (gPrefetchInFlight.fetch_add(1) >= kMaxConcurrentPrefetch)
+        {
+            gPrefetchInFlight.fetch_sub(1);
+            SnapshotEnd(snapPath);
+            return;
+        }
+    }
+
+    OnvifConfig cfgCopy = mOnvifConfig;
+    std::vector<uint8_t> keyframeCopy;
+    bool cacheFresh = false;
+    {
+        std::lock_guard<std::mutex> lk(mKeyframeMutex);
+        keyframeCopy = mLastLiveKeyframe;
+        if (!mLastLiveKeyframe.empty())
+            cacheFresh = (std::chrono::steady_clock::now() - mLastLiveKeyframeTime) < std::chrono::seconds(60);
+    }
+    std::string tmpPath = snapPath + ".tmp";
+    std::thread([cfgCopy, keyframeCopy, liveActive, cacheFresh, snapPath, tmpPath, onvifOnly]() {
+        std::error_code e;
+        if (GenerateSnapshotJpeg(cfgCopy, keyframeCopy, liveActive, cacheFresh, tmpPath, onvifOnly))
+            std::filesystem::rename(tmpPath, snapPath, e); // atomic swap-in
+        else
+            std::filesystem::remove(tmpPath, e);
+        SnapshotEnd(snapPath);
+        if (onvifOnly)
+            gPrefetchInFlight.fetch_sub(1);
+    }).detach();
+}
 
 CameraError CameraDevice::CaptureSnapshot(const chip::app::DataModel::Nullable<uint16_t> streamID,
                                           const VideoResolutionStruct & resolution, ImageSnapshot & outImageSnapshot)
@@ -1306,45 +1655,8 @@ CameraError CameraDevice::CaptureSnapshot(const chip::app::DataModel::Nullable<u
     // it is safe even if this CameraDevice is destroyed while it runs. Cache lives in tmpfs
     // (no flash wear, auto-cleaned on reboot); the atomic rename means readers never see a
     // partial file.
-    std::error_code snapEc;
-    std::filesystem::create_directories("/tmp/onvif-bridge", snapEc);
-    std::string snapPath =
-        "/tmp/onvif-bridge/snapshot_" + std::to_string(std::hash<std::string>{}(mOnvifConfig.rtspUrl)) + ".jpg";
-
-    // Refresh at most once per TTL, on a detached thread. GenerateSnapshotJpeg picks a source that
-    // never fights live view: it prefers the cached live keyframe (no RTSP) and only opens a
-    // dedicated RTSP session when nothing is streaming. Snapshot copies of the config + latest
-    // keyframe are captured by value so the thread is safe even if this CameraDevice is destroyed.
-    constexpr auto kSnapshotTtlSec = 10;
-    bool liveActive                = mActiveVideoStreams.load() > 0;
-    bool stale                     = true;
-    {
-        std::error_code e;
-        auto mtime = std::filesystem::last_write_time(snapPath, e);
-        if (!e)
-            stale = (std::filesystem::file_time_type::clock::now() - mtime) > std::chrono::seconds(kSnapshotTtlSec);
-    }
-    if (stale && TrySnapshotBegin(snapPath))
-    {
-        OnvifConfig cfgCopy = mOnvifConfig;
-        std::vector<uint8_t> keyframeCopy;
-        bool cacheFresh = false;
-        {
-            std::lock_guard<std::mutex> lk(mKeyframeMutex);
-            keyframeCopy = mLastLiveKeyframe;
-            if (!mLastLiveKeyframe.empty())
-                cacheFresh = (std::chrono::steady_clock::now() - mLastLiveKeyframeTime) < std::chrono::seconds(60);
-        }
-        std::string tmpPath = snapPath + ".tmp";
-        std::thread([cfgCopy, keyframeCopy, liveActive, cacheFresh, snapPath, tmpPath]() {
-            std::error_code e;
-            if (GenerateSnapshotJpeg(cfgCopy, keyframeCopy, liveActive, cacheFresh, tmpPath))
-                std::filesystem::rename(tmpPath, snapPath, e); // atomic swap-in
-            else
-                std::filesystem::remove(tmpPath, e);
-            SnapshotEnd(snapPath);
-        }).detach();
-    }
+    const std::string snapPath = SnapshotCachePath();
+    TriggerSnapshotRefresh();
 
     // Return the most recent cached JPEG. On the very first request (none cached yet) this
     // fails; the controller retries and gets the image once the background refresh finishes.
@@ -1387,26 +1699,54 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
+    // Serialise against StopVideoStream and the RTSP watchdog's in-place restarts (this is
+    // called from Matter-thread contexts AND from the media controller on WebRTC threads).
+    std::lock_guard<std::mutex> lifecycleLock(mPipelineLifecycleMutex);
+
     // On-demand reference counting: multiple consumers (live WebRTC viewers and/or
     // the push recorder) share a single pipeline. If one is already running, just
     // record the extra consumer and reuse it; StopVideoStream tears the pipeline
     // down only when the last consumer leaves. This avoids pulling the camera's
-    // RTSP stream 24/7 when nobody is watching.
-    if (it->videoContext != nullptr)
+    // RTSP stream 24/7 when nobody is watching. Keyed on the consumer count, NOT on
+    // videoContext: after a failed watchdog rebuild the pipeline pointer is null while
+    // consumers remain registered, and the watchdog keeps retrying on its backoff.
+    auto rcIt = mVideoStreamConsumers.find(streamID);
+    if (rcIt != mVideoStreamConsumers.end() && rcIt->second > 0)
     {
-        mVideoStreamConsumers[streamID]++;
-        ChipLogProgress(Camera, "Video stream %u already running; consumers=%d", streamID, mVideoStreamConsumers[streamID]);
+        rcIt->second++;
+        ChipLogProgress(Camera, "Video stream %u already running; consumers=%d", streamID, rcIt->second);
         return CameraError::SUCCESS;
     }
 
+    CameraError error = BuildAndStartVideoPipeline(*it);
+    if (error != CameraError::SUCCESS)
+    {
+        return error;
+    }
+
+    mVideoStreamConsumers[streamID] = 1; // first consumer
+    mActiveVideoStreams.fetch_add(1);    // a live pipeline now holds an RTSP session
+    StartWatchdog();                     // spawn/wake the RTSP no-data watchdog
+
+    return CameraError::SUCCESS;
+}
+
+// Build + start the GStreamer pipeline for one allocated video stream. Consumer ref-counts
+// are NOT touched here — StartVideoStream and the watchdog restart own those. Caller must
+// hold mPipelineLifecycleMutex.
+CameraError CameraDevice::BuildAndStartVideoPipeline(VideoStream & stream)
+{
+    const VideoStreamStruct & params = stream.videoStreamParams;
+    const uint16_t streamID          = params.videoStreamID;
+
     // Create Gstreamer video pipeline using the final allocated stream parameters
     CameraError error          = CameraError::SUCCESS;
-    GstElement * videoPipeline = CreateVideoPipeline(mVideoDevicePath, allocatedStream.minResolution.width,
-                                                     allocatedStream.minResolution.height, allocatedStream.minFrameRate, error);
+    GstElement * videoPipeline = CreateVideoPipeline(mVideoDevicePath, params.minResolution.width, params.minResolution.height,
+                                                     params.minFrameRate, error);
     if (videoPipeline == nullptr)
     {
         ChipLogError(Camera, "Failed to create video pipeline.");
-        it->videoContext = nullptr;
+        stream.videoContext = nullptr;
         return error;
     }
 
@@ -1420,8 +1760,8 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
         gst_object_unref(appsink);
     }
 
-    ChipLogProgress(Camera, "Starting video stream (id=%u): %u×%u @ %ufps", streamID, allocatedStream.minResolution.width,
-                    allocatedStream.minResolution.height, allocatedStream.minFrameRate);
+    ChipLogProgress(Camera, "Starting video stream (id=%u): %u×%u @ %ufps", streamID, params.minResolution.width,
+                    params.minResolution.height, params.minFrameRate);
 
     // Start the pipeline
     ChipLogProgress(Camera, "Requesting PLAYING …");
@@ -1466,7 +1806,7 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
 
         ChipLogError(Camera, "Failed to start video pipeline.");
         gst_object_unref(videoPipeline);
-        it->videoContext = nullptr;
+        stream.videoContext = nullptr;
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
@@ -1487,14 +1827,21 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
         ChipLogError(Camera, "Video pipeline failed to start.");
         gst_element_set_state(videoPipeline, GST_STATE_NULL);
         gst_object_unref(videoPipeline);
-        it->videoContext = nullptr;
+        stream.videoContext = nullptr;
         return CameraError::ERROR_VIDEO_STREAM_START_FAILED;
     }
 
     // Store in stream context (keep it even if the live source is still negotiating).
-    it->videoContext            = videoPipeline;
-    mVideoStreamConsumers[streamID] = 1; // first consumer
-    mActiveVideoStreams.fetch_add(1);    // a live pipeline now holds an RTSP session
+    stream.videoContext = videoPipeline;
+
+    // Seed the watchdog: measure the no-data window from the PLAYING request so a slow
+    // rtspsrc negotiation isn't misread as a stall.
+    {
+        std::lock_guard<std::mutex> lk(mWatchdogMutex);
+        auto now = std::chrono::steady_clock::now();
+        mWatchdogStreams[streamID].lastData = now;
+        mWatchdogStreams[streamID].pipelineStart = now;
+    }
 
     if (state == GST_STATE_PLAYING)
     {
@@ -1507,6 +1854,39 @@ CameraError CameraDevice::StartVideoStream(const VideoStreamStruct & allocatedSt
     }
 
     return CameraError::SUCCESS;
+}
+
+// Stop and free one stream's pipeline WITHOUT touching consumer ref-counts (the watchdog
+// rebuilds under live consumers). Caller must hold mPipelineLifecycleMutex. Returns false
+// when the GStreamer state change failed (the pipeline is unref'd regardless).
+bool CameraDevice::TearDownVideoPipeline(VideoStream & stream)
+{
+    GstElement * videoPipeline = reinterpret_cast<GstElement *>(stream.videoContext);
+    if (videoPipeline == nullptr)
+    {
+        return true;
+    }
+
+    // set_state(NULL) blocks until the streaming thread has drained out of the appsink
+    // callback, so no callback runs concurrently past this point. mWatchdogMutex is NOT held
+    // across set_state(NULL) (that would deadlock: the callback takes it), only around the
+    // map erase below.
+    GstStateChangeReturn result = gst_element_set_state(videoPipeline, GST_STATE_NULL);
+    gst_object_unref(videoPipeline);
+    stream.videoContext = nullptr;
+
+    // A rebuilt pipeline restarts PTS from zero; recompute the wall-clock offset on the first
+    // buffer of the new pipeline. Guarded by mWatchdogMutex (F1) — the same mutex the appsink
+    // callback holds for its mVideoStreamPtsOffsetMs accesses.
+    {
+        std::lock_guard<std::mutex> lk(mWatchdogMutex);
+        mVideoStreamPtsOffsetMs.erase(stream.videoStreamParams.videoStreamID);
+        mAudioBranchLinked = false;
+        mAudioEpoch = 0;
+        mAudioPadTimeoutLogged = false;
+    }
+
+    return result != GST_STATE_CHANGE_FAILURE;
 }
 
 // Stop video stream
@@ -1532,6 +1912,9 @@ CameraError CameraDevice::StopVideoStream(uint16_t streamID)
         return CameraError::ERROR_VIDEO_STREAM_STOP_FAILED;
     }
 
+    // Serialise against StartVideoStream and the RTSP watchdog's in-place restarts.
+    std::lock_guard<std::mutex> lifecycleLock(mPipelineLifecycleMutex);
+
     // Reference counted: keep the pipeline alive while other consumers remain;
     // only tear it down when the last consumer leaves.
     auto rcIt = mVideoStreamConsumers.find(streamID);
@@ -1545,23 +1928,293 @@ CameraError CameraDevice::StopVideoStream(uint16_t streamID)
     if (mActiveVideoStreams.load() > 0)
         mActiveVideoStreams.fetch_sub(1); // last consumer left; the live RTSP session is freed
 
-    GstElement * videoPipeline = reinterpret_cast<GstElement *>(it->videoContext);
-    if (videoPipeline != nullptr)
+    // Tear the pipeline down FIRST: set_state(NULL) blocks until the streaming thread has
+    // drained out of the appsink callback, so no further NoteVideoDataLocked can re-insert a
+    // watchdog entry after we erase it below (F2).
+    const bool teardownOk = TearDownVideoPipeline(*it);
+
+    // Now safe to forget this stream: no consumers, no more callbacks.
     {
-        GstStateChangeReturn result = gst_element_set_state(videoPipeline, GST_STATE_NULL);
+        std::lock_guard<std::mutex> lk(mWatchdogMutex);
+        mWatchdogStreams.erase(streamID);
+    }
 
-        // Always clean up, regardless of state change result
-        gst_object_unref(videoPipeline);
-        it->videoContext = nullptr;
+    return teardownOk ? CameraError::SUCCESS : CameraError::ERROR_VIDEO_STREAM_STOP_FAILED;
+}
 
-        if (result == GST_STATE_CHANGE_FAILURE)
+// ---------------------------------------------------------------------------------------------
+// RTSP no-data watchdog. See the block comment in camera-device.h for the field failure this
+// recovers from (camera stalls its RTSP session after a PushAV clip; the pipeline stays
+// "running" and the standing PushAV consumer keeps the ref-count from ever reaching 0).
+// Pure media layer: none of this touches the CHIP stack, so no StackLock is involved.
+// ---------------------------------------------------------------------------------------------
+
+// Called from the appsink streaming thread for every video buffer, with mWatchdogMutex held.
+void CameraDevice::NoteVideoDataLocked(uint16_t videoStreamID)
+{
+    auto & st   = mWatchdogStreams[videoStreamID];
+    st.lastData = std::chrono::steady_clock::now();
+    if (st.backoffSec != 0)
+    {
+        ChipLogProgress(Camera, "RTSP watchdog: video data flowing again on stream %u; backoff reset", videoStreamID);
+        st.backoffSec  = 0;
+        st.nextRestart = std::chrono::steady_clock::time_point{};
+    }
+}
+
+// Called from the appsink streaming thread for each video buffer. Under mWatchdogMutex (F1):
+// feeds the RTSP no-data watchdog (proving the camera is delivering data) and computes the
+// wall-clock timestamp from the raw PTS using the per-stream offset map (which the watchdog
+// thread erases on restart, hence the shared lock). Returns true if the frame should be
+// forwarded (timestamp monotonic w.r.t. the stream's first PTS), with outTs/outFirstPts set.
+bool CameraDevice::HandleVideoBufferTimestamp(uint16_t videoStreamID, uint64_t rawPts, int64_t & outTs, int64_t & outFirstPts)
+{
+    std::lock_guard<std::mutex> wlk(mWatchdogMutex);
+
+    NoteVideoDataLocked(videoStreamID);
+
+    auto firstPtsIt = mVideoStreamPtsOffsetMs.find(videoStreamID);
+    if (firstPtsIt == mVideoStreamPtsOffsetMs.end())
+    {
+        auto now                               = std::chrono::steady_clock::now().time_since_epoch();
+        int64_t nowMs                          = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        int64_t rawMs                          = static_cast<int64_t>(rawPts / 1000000);
+        mVideoStreamPtsOffsetMs[videoStreamID] = nowMs - rawMs;
+    }
+    outFirstPts = mVideoStreamPtsOffsetMs[videoStreamID];
+    outTs       = outFirstPts + static_cast<int64_t>(rawPts / 1000000);
+    return outTs >= outFirstPts;
+}
+
+void CameraDevice::SetAudioBranchLinked(bool linked)
+{
+    std::lock_guard<std::mutex> lk(mWatchdogMutex);
+    mAudioBranchLinked = linked;
+}
+
+void CameraDevice::StartWatchdog()
+{
+    {
+        std::lock_guard<std::mutex> lk(mWatchdogCvMutex);
+        if (mWatchdogStop)
         {
-            return CameraError::ERROR_VIDEO_STREAM_STOP_FAILED;
+            return; // shutting down; don't spawn a new thread
+        }
+        // Set the wake flag BEFORE notifying so a watchdog about to go dormant (it just
+        // observed "no consumers") cannot miss this start (lost-wakeup guard).
+        mWatchdogWake = true;
+        if (!mWatchdogThread.joinable())
+        {
+            mWatchdogThread = std::thread([this]() { WatchdogLoop(); });
         }
     }
-    mVideoStreamPtsOffsetMs.erase(streamID);
+    mWatchdogCv.notify_all(); // wake a dormant watchdog: a pipeline just started
+}
 
-    return CameraError::SUCCESS;
+void CameraDevice::StopWatchdog()
+{
+    {
+        std::lock_guard<std::mutex> lk(mWatchdogCvMutex);
+        mWatchdogStop = true;
+    }
+    mWatchdogCv.notify_all();
+    if (mWatchdogThread.joinable())
+    {
+        mWatchdogThread.join();
+    }
+}
+
+void CameraDevice::WatchdogLoop()
+{
+    for (;;)
+    {
+        // Run the stream check OUTSIDE the cv mutex — it takes mPipelineLifecycleMutex, and
+        // StartWatchdog takes mWatchdogCvMutex while holding the lifecycle lock, so holding
+        // both here in the other order would risk a deadlock. hasConsumers is derived from the
+        // SAME consumer refcount that keeps the pipeline alive (mVideoStreamConsumers), so a
+        // PushAV standing consumer keeps the watchdog awake through a viewerless stall.
+        const bool hasConsumers = WatchdogCheckStreams();
+
+        std::unique_lock<std::mutex> lk(mWatchdogCvMutex);
+        if (mWatchdogStop)
+        {
+            return;
+        }
+        if (hasConsumers)
+        {
+            // Pipelines are live: 1 s tick (or wake early on stop).
+            mWatchdogCv.wait_for(lk, std::chrono::seconds(kWatchdogPollSec), [this] { return mWatchdogStop; });
+        }
+        else
+        {
+            // No consumer on any stream: go fully dormant (idle cameras must cost ~0). Woken by
+            // StartWatchdog when a pipeline starts; the mWatchdogWake predicate closes the
+            // lost-wakeup window between WatchdogCheckStreams observing "no consumers" and this
+            // wait.
+            mWatchdogCv.wait(lk, [this] { return mWatchdogStop || mWatchdogWake; });
+        }
+        mWatchdogWake = false;
+        if (mWatchdogStop)
+        {
+            return;
+        }
+    }
+}
+
+bool CameraDevice::WatchdogCheckStreams()
+{
+    std::lock_guard<std::mutex> lifecycleLock(mPipelineLifecycleMutex);
+    const auto now    = std::chrono::steady_clock::now();
+    bool anyConsumers = false;
+
+    for (auto & stream : mVideoStreams)
+    {
+        const uint16_t streamID = stream.videoStreamParams.videoStreamID;
+
+        // Only pipelines that are supposed to be streaming (>= 1 registered consumer).
+        auto rcIt = mVideoStreamConsumers.find(streamID);
+        if (rcIt == mVideoStreamConsumers.end() || rcIt->second <= 0)
+        {
+            continue;
+        }
+        anyConsumers = true;
+
+        // Read (and defensively seed) this stream's watchdog state. A stream that has a
+        // consumer but no entry yet — e.g. a pipeline that connected but has not delivered a
+        // single frame, the common post-recording stall — gets seeded here so its no-data
+        // window starts now and becomes detectable, instead of being skipped forever.
+        std::chrono::steady_clock::time_point lastData;
+        std::chrono::steady_clock::time_point nextRestart;
+        int backoffSec = 0;
+        {
+            std::lock_guard<std::mutex> lk(mWatchdogMutex);
+            auto wit = mWatchdogStreams.find(streamID);
+            if (wit == mWatchdogStreams.end())
+            {
+                WatchdogStreamState seed;
+                seed.lastData          = now;
+                seed.pipelineStart     = now;
+                mWatchdogStreams[streamID] = seed;
+                continue; // just seeded; evaluate on the next tick
+            }
+            lastData    = wit->second.lastData;
+            nextRestart = wit->second.nextRestart;
+            backoffSec  = wit->second.backoffSec;
+        }
+
+        // Bounded retry: while inside the backoff window, do nothing AND leave any bus
+        // ERROR/EOS queued (F5) so it is acted on the moment the backoff expires rather than
+        // being consumed and lost.
+        if (now < nextRestart)
+        {
+            continue;
+        }
+
+        GstElement * pipeline = reinterpret_cast<GstElement *>(stream.videoContext);
+
+        // Hook bus ERROR/EOS into the restart path (historically only a start-failure check
+        // existed; a mid-stream error or EOS left the pipeline dead forever).
+        bool busFailure = false;
+        if (pipeline != nullptr)
+        {
+            GstBus * bus = gst_element_get_bus(pipeline);
+            if (bus != nullptr)
+            {
+                GstMessage * msg;
+                while ((msg = gst_bus_pop_filtered(bus, (GstMessageType) (GST_MESSAGE_ERROR | GST_MESSAGE_EOS))) != nullptr)
+                {
+                    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR)
+                    {
+                        GError * err       = nullptr;
+                        gchar * debug_info = nullptr;
+                        gst_message_parse_error(msg, &err, &debug_info);
+                        ChipLogError(Camera, "RTSP watchdog: pipeline ERROR on video stream %u: %s", streamID,
+                                     err ? err->message : "unknown");
+                        g_clear_error(&err);
+                        g_free(debug_info);
+                    }
+                    else
+                    {
+                        ChipLogError(Camera, "RTSP watchdog: pipeline EOS on video stream %u", streamID);
+                    }
+                    busFailure = true;
+                    gst_message_unref(msg);
+                }
+                gst_object_unref(bus);
+            }
+        }
+
+        const bool noData = (now - lastData) >= std::chrono::seconds(kWatchdogNoDataSec);
+        // pipeline == nullptr here means an earlier rebuild failed hard while consumers are
+        // still registered — keep retrying on the backoff schedule.
+        const bool pipelineMissing = (pipeline == nullptr);
+
+        // Pad timeout: video is flowing (or pipeline started) but audio branch was never linked after kWatchdogNoDataSec
+        {
+            std::lock_guard<std::mutex> lk(mWatchdogMutex);
+            if (pipeline != nullptr && mOnvifConfig.HasVerifiedAudio() && !mAudioBranchLinked && !mAudioPadTimeoutLogged)
+            {
+                auto start_time = mWatchdogStreams[streamID].pipelineStart;
+                if ((now - start_time) >= std::chrono::seconds(kWatchdogNoDataSec))
+                {
+                    ChipLogProgress(Camera, "CAM_AUDIO unavailable reason=pad_timeout");
+                    mAudioPadTimeoutLogged = true;
+                }
+            }
+        }
+
+        if (!(busFailure || noData || pipelineMissing))
+        {
+            continue;
+        }
+
+        // Grow the backoff (doubling, capped); it is reset by NoteVideoDataLocked the moment
+        // data flows again. Retries continue forever at the capped interval — the camera may
+        // come back at any time and there is no other recovery path.
+        int newBackoff = (backoffSec == 0) ? kWatchdogInitialBackoffSec : backoffSec * 2;
+        if (newBackoff > kWatchdogMaxBackoffSec)
+        {
+            newBackoff = kWatchdogMaxBackoffSec;
+        }
+
+        if (busFailure)
+        {
+            ChipLogError(Camera, "RTSP watchdog: bus ERROR/EOS on video stream %u — restarting pipeline (retry backoff %ds)",
+                         streamID, newBackoff);
+        }
+        else if (pipelineMissing)
+        {
+            ChipLogError(Camera, "RTSP watchdog: no pipeline for video stream %u (previous rebuild failed) — rebuilding (retry backoff %ds)",
+                         streamID, newBackoff);
+        }
+        else
+        {
+            ChipLogError(Camera, "RTSP watchdog: no video data for %ds on stream %u — restarting pipeline (retry backoff %ds)",
+                         kWatchdogNoDataSec, streamID, newBackoff);
+        }
+
+        // Tear down + rebuild IN PLACE: consumers stay registered (the ref-count path cannot
+        // recover this case — the PushAV transport is a standing consumer between clips, so
+        // the count never reaches 0), and mActiveVideoStreams keeps counting the stream so a
+        // concurrent snapshot won't open a competing RTSP session against the same camera.
+        TearDownVideoPipeline(stream);
+
+        {
+            std::lock_guard<std::mutex> lk(mWatchdogMutex);
+            auto & st      = mWatchdogStreams[streamID];
+            st.backoffSec  = newBackoff;
+            st.nextRestart = now + std::chrono::seconds(newBackoff);
+            st.lastData    = now; // measure the fresh pipeline's no-data window from now
+        }
+
+        if (BuildAndStartVideoPipeline(stream) != CameraError::SUCCESS)
+        {
+            ChipLogError(Camera, "RTSP watchdog: pipeline rebuild failed for video stream %u; will retry in %ds", streamID,
+                         newBackoff);
+        }
+    }
+
+    return anyConsumers;
 }
 
 // Start audio stream
@@ -1574,6 +2227,25 @@ CameraError CameraDevice::StartAudioStream(uint16_t streamID)
     {
         ChipLogError(Camera, "Audio streamID : %u not found", streamID);
         return CameraError::ERROR_AUDIO_STREAM_START_FAILED;
+    }
+
+    if (!mOnvifConfig.rtspUrl.empty())
+    {
+        {
+            std::lock_guard<std::mutex> lk(mWatchdogMutex);
+            mAudioDeliveryEnabled = true;
+        }
+        if (LinuxDeviceOptions::GetInstance().cameraAudioPlayback)
+        {
+            CameraError playbackError = StartAudioPlaybackStream();
+            if (playbackError != CameraError::SUCCESS)
+            {
+                ChipLogError(Camera, "Failed to start audio playback pipeline for stream ID: %u. Error: %d", streamID,
+                             static_cast<int>(playbackError));
+            }
+        }
+        ChipLogProgress(Camera, "CAM_AUDIO started streamID=%u", streamID);
+        return CameraError::SUCCESS;
     }
 
     int channels   = it->audioStreamParams.channelCount;
@@ -1652,6 +2324,25 @@ CameraError CameraDevice::StopAudioStream(uint16_t streamID)
     if (it == mAudioStreams.end())
     {
         return CameraError::ERROR_AUDIO_STREAM_STOP_FAILED;
+    }
+
+    if (!mOnvifConfig.rtspUrl.empty())
+    {
+        {
+            std::lock_guard<std::mutex> lk(mWatchdogMutex);
+            mAudioDeliveryEnabled = false;
+        }
+        if (LinuxDeviceOptions::GetInstance().cameraAudioPlayback)
+        {
+            CameraError playbackError = StopAudioPlaybackStream();
+            if (playbackError != CameraError::SUCCESS)
+            {
+                ChipLogError(Camera, "Failed to stop audio playback pipeline for stream ID: %u. Error: %d", streamID,
+                             static_cast<int>(playbackError));
+            }
+        }
+        ChipLogProgress(Camera, "CAM_AUDIO stopped streamID=%u", streamID);
+        return CameraError::SUCCESS;
     }
 
     GstElement * audioPipeline = reinterpret_cast<GstElement *>(it->audioContext);
@@ -2305,27 +2996,38 @@ void CameraDevice::InitializeVideoStreams()
 
 void CameraDevice::InitializeAudioStreams()
 {
-    // Mono stream
-    AudioStream monoStream = { { 1 /* Id */, StreamUsageEnum::kLiveView, AudioCodecEnum::kOpus, 1 /* ChannelCount: Mono */,
+    mAudioStreams.clear();
+    if (mOnvifConfig.HasVerifiedAudio())
+    {
+        AudioStream stream = { { 1 /* Id */, StreamUsageEnum::kLiveView, AudioCodecEnum::kOpus, 1 /* ChannelCount: Mono */,
                                  48000 /* SampleRate */, 20000 /* BitRate */, 24 /* BitDepth */, 0 /* RefCount */ },
                                false,
                                nullptr };
-    mAudioStreams.push_back(monoStream);
-
-    // Stereo stream
-    AudioStream stereoStream = { { 2 /* Id */, StreamUsageEnum::kLiveView, AudioCodecEnum::kOpus, 2 /* ChannelCount: Stereo */,
-                                   48000 /* SampleRate */, 32000 /* BitRate */, 24 /* BitDepth */, 0 /* RefCount */ },
-                                 false,
-                                 nullptr };
-    mAudioStreams.push_back(stereoStream);
-
-    // Max channel count stream (from spec constant)
-    AudioStream maxChannelStream = { { 3 /* Id */, StreamUsageEnum::kLiveView, AudioCodecEnum::kOpus,
-                                       kMicrophoneMaxChannelCount /* Max from Spec */, 48000 /* SampleRate */, 64000 /* BitRate */,
-                                       24 /* BitDepth */, 0 /* RefCount */ },
-                                     false,
-                                     nullptr };
-    mAudioStreams.push_back(maxChannelStream);
+        mAudioStreams.push_back(stream);
+        ChipLogProgress(Camera, "CAM_AUDIO stream initialized: stream_id=1 codec=Opus rate=48000 channels=1");
+    }
+    else
+    {
+        // [live-view] This camera has no real inbound audio, but HasMicrophone() is advertised
+        // as true (kept true so SmartThings allows clip recording — see camera-device.h). With the
+        // microphone feature advertised, SmartThings' FIRST live-view step is AudioStreamAllocate
+        // for a LiveView audio stream; if there is NO allocatable audio stream that call fails with
+        // DYNAMIC_CONSTRAINT_ERROR and SmartThings never proceeds to video — i.e. no live view at
+        // all. So publish ONE default, allocatable Opus stream whose params satisfy the controller's
+        // request (AudioStream::IsCompatible checks audioCodec==, and channelCount/sampleRate/bitDepth
+        // >= the request; bitRate is not checked). No real audio flows on it — the RTSP pipeline has
+        // no audio branch and the HAL audio start no-ops gracefully (logs, does not fail the
+        // allocate) — the controller tolerates a silent audio track, and live VIDEO now allocates and
+        // streams normally. This keeps clip recording working (audio feature present) AND unblocks
+        // live view.
+        AudioStream stream = { { 1 /* Id */, StreamUsageEnum::kLiveView, AudioCodecEnum::kOpus, 1 /* ChannelCount: Mono */,
+                                 48000 /* SampleRate */, 20000 /* BitRate */, 24 /* BitDepth */, 0 /* RefCount */ },
+                               false,
+                               nullptr };
+        mAudioStreams.push_back(stream);
+        ChipLogProgress(Camera, "CAM_AUDIO: no real inbound audio — publishing a silent default Opus stream so live-view "
+                                "AudioStreamAllocate succeeds (video-only; clip recording keeps the audio feature)");
+    }
 }
 
 void CameraDevice::InitializeSnapshotStreams()

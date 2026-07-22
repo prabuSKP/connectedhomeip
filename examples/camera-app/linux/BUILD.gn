@@ -79,6 +79,7 @@ pkg_config("gstreamer") {
   packages = [
     "gstreamer-1.0",
     "gstreamer-app-1.0",
+    "gstreamer-rtsp-1.0",  # GstRTSPMessage header edit for the Hikvision Basic-auth override
     "gobject-2.0",
   ]
 }

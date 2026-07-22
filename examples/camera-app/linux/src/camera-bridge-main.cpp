@@ -87,6 +87,21 @@ using namespace Camera;
 // ---------------------------------------------------------------------------
 namespace {
 
+void PopulateAudioCapability(const std::string & codec, int rate, int channels, int has_audio_in, Camera::OnvifConfig & onvif)
+{
+    onvif.audioCapability.verifiedByRtspSdp = has_audio_in != 0;
+    if (codec == "PCMU")
+        onvif.audioCapability.codec = Camera::InboundAudioCodec::kPcmu;
+    else if (codec == "PCMA")
+        onvif.audioCapability.codec = Camera::InboundAudioCodec::kPcma;
+    else if (codec == "OPUS")
+        onvif.audioCapability.codec = Camera::InboundAudioCodec::kOpus;
+    else
+        onvif.audioCapability.codec = Camera::InboundAudioCodec::kUnsupported;
+    onvif.audioCapability.clockRateHz = rate;
+    onvif.audioCapability.channels = static_cast<uint8_t>(channels);
+}
+
 constexpr int kDescriptorAttrSize = 254;
 
 // Minimal ember endpoint definition for a bridged camera.
@@ -321,6 +336,9 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
 
     // Probe a main/sub URL pair: main first; if main is H.265 (our pipeline is
     // H.264-only passthrough) try the substream, which is commonly H.264.
+    rtsp_probe_result_t chosenRes;
+    memset(&chosenRes, 0, sizeof(chosenRes));
+
     auto probePair = [&](const std::string & mainUrl, const std::string & subUrl) -> int {
         rtsp_probe_result_t res;
         int rc     = onvif_rtsp_probe(mainUrl.c_str(), user.c_str(), pass.c_str(), /*timeout=*/5, &res);
@@ -328,6 +346,7 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
         streamKind = "mainstream";
         codecOut   = res.codec;
         authNote   = res.auth_note;
+        chosenRes  = res;
         if (rc == RTSP_PROBE_NO_H264 && std::string(res.codec) == "H265")
         {
             ChipLogProgress(Camera, "CameraBridge: %s main stream is H.265 — trying substream", ip.c_str());
@@ -338,6 +357,7 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
                 chosenUrl  = subUrl;
                 streamKind = "substream";
                 codecOut   = subRes.codec;
+                chosenRes  = subRes;
                 return subRc;
             }
         }
@@ -392,6 +412,8 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
     entry.onvif.token.clear();
     entry.onvif.user = user;
     entry.onvif.pass = pass;
+    entry.onvif.needsBasicAuth = chosenRes.used_basic_fallback ? true : false;
+    PopulateAudioCapability(chosenRes.audio_codec, chosenRes.audio_rate, chosenRes.audio_channels, chosenRes.has_audio, entry.onvif);
     ChipLogProgress(Camera, "CameraBridge: direct-RTSP onboarded '%s' (%s) rtsp=%s codec=%s", entry.name.c_str(),
                     dni.c_str(), chosenUrl.c_str(), codecOut.c_str());
     return RTSP_PROBE_OK;
@@ -562,6 +584,22 @@ bool RemoveCameraByDni(const std::string & dni, bool purgePersistedTransports)
     return false;
 }
 
+// The RTSP Digest-quirk verdict (OnvifConfig::needsBasicAuth) is a CAMERA-firmware
+// property, detected once at first onboard and STABLE across credential changes. Return
+// the known verdict (0/1) for an already-bridged camera with this stable id, or -1 if
+// the camera is not currently bridged (a fresh onboard -> the resolver should probe once
+// to detect it). Passing the known value into onvif_resolve_bridge on a re-resolve means
+// a later password/IP change never re-probes RTSP (no extra login attempts, no Hikvision
+// lockout risk) and never flips a good verdict because a new/failed credential was tried.
+// Runs on the IPC/discovery thread — the only mutator of gBridgedCameras — so no lock.
+int KnownBasicAuth(const std::string & sid)
+{
+    for (const auto & cam : gBridgedCameras)
+        if (StableCameraId(cam->GetEntry().dni) == sid)
+            return cam->GetEntry().onvif.needsBasicAuth ? 1 : 0;
+    return -1;
+}
+
 // Persist the current camera list to cameras.json so IPC-added cameras survive a
 // restart. Called on the IPC thread after each successful add/remove.
 void PersistCameras()
@@ -585,12 +623,16 @@ bool ResolveDiscoveredCamera(const onvif_discovered_t & d, const std::string & s
 {
     onvif_resolved_bridge_t res;
     std::string cu = gDefaultUser, cp = gDefaultPass;
-    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    // Fresh onboard (this path only runs for cameras not already known): -1 => probe
+    // RTSP once to detect the broken-Digest quirk. KnownBasicAuth returns the persisted
+    // verdict on the off chance this stable id is already bridged (then no re-probe).
+    int prior = KnownBasicAuth(sid);
+    int drc   = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, prior, &res);
     if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
     {
         cu.clear(); // default creds rejected — fall back to anonymous
         cp.clear();
-        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, prior, &res);
     }
     if (drc != ONVIF_BRIDGE_OK)
         return false;
@@ -606,6 +648,7 @@ bool ResolveDiscoveredCamera(const onvif_discovered_t & d, const std::string & s
     e.onvif.token       = res.token;
     e.onvif.user        = cu;
     e.onvif.pass        = cp;
+    e.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
     return true;
 }
 
@@ -618,12 +661,15 @@ bool ReresolveMovedCamera(const onvif_discovered_t & d, CameraConfig::CameraEntr
     onvif_resolved_bridge_t res;
     std::string cu = entry.onvif.user.empty() ? gDefaultUser : entry.onvif.user;
     std::string cp = entry.onvif.pass.empty() ? gDefaultPass : entry.onvif.pass;
-    int drc = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+    // Known camera (only its IP changed): pass the existing verdict so we don't re-probe
+    // RTSP for the Digest quirk — it's a firmware property, unchanged by the IP move.
+    int prior = entry.onvif.needsBasicAuth ? 1 : 0;
+    int drc   = onvif_resolve_bridge(d.control_url, cu.c_str(), cp.c_str(), /*want_main=*/1, prior, &res);
     if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
     {
         cu.clear();
         cp.clear();
-        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, &res);
+        drc = onvif_resolve_bridge(d.control_url, "", "", /*want_main=*/1, prior, &res);
     }
     if (drc != ONVIF_BRIDGE_OK)
         return false;
@@ -635,6 +681,7 @@ bool ReresolveMovedCamera(const onvif_discovered_t & d, CameraConfig::CameraEntr
     entry.onvif.token       = res.token;
     entry.onvif.user        = cu;
     entry.onvif.pass        = cp;
+    entry.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
     return true;
 }
 
@@ -796,10 +843,12 @@ DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool 
         std::string controlUrl = "http://" + ip + "/onvif/device_service";
         std::string cu = gDefaultUser, cp = gDefaultPass;
         onvif_resolved_bridge_t res;
-        int drc = onvif_resolve_bridge(controlUrl.c_str(), cu.c_str(), cp.c_str(), /*want_main=*/1, &res);
+        // Fresh onboard (stage A did not match this camera as known): -1 => probe RTSP
+        // once to detect the broken-Digest quirk.
+        int drc = onvif_resolve_bridge(controlUrl.c_str(), cu.c_str(), cp.c_str(), /*want_main=*/1, /*prior=*/-1, &res);
         if (drc != ONVIF_BRIDGE_OK && !(cu.empty() && cp.empty()))
         {
-            drc = onvif_resolve_bridge(controlUrl.c_str(), "", "", 1, &res);
+            drc = onvif_resolve_bridge(controlUrl.c_str(), "", "", 1, /*prior=*/-1, &res);
             if (drc == ONVIF_BRIDGE_OK)
             {
                 cu.clear();
@@ -822,6 +871,8 @@ DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool 
             e.onvif.token       = res.token;
             e.onvif.user        = cu;
             e.onvif.pass        = cp;
+            e.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+            PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in, e.onvif);
             ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
                             e.dni.c_str(), e.onvif.rtspUrl.c_str());
             mergeOrAppend(std::move(e));
@@ -954,9 +1005,13 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     BridgeIpc::OpResult out;
 
     // Resolve ONVIF off the Matter event loop (blocking SOAP network calls).
+    // Basic-auth verdict: known (0/1) if this stable id is already bridged (a re-onboard —
+    // e.g. the Edge driver re-pushing a camera, or a password change) so we preserve it
+    // without re-probing RTSP; -1 for a genuinely new camera, which probes once to detect.
     onvif_resolved_bridge_t res;
     int wantMain = (req.stream != "substream") ? 1 : 0;
-    int rc       = onvif_resolve_bridge(req.controlUrl.c_str(), req.userid.c_str(), req.password.c_str(), wantMain, &res);
+    int prior    = KnownBasicAuth(StableCameraId(req.dni));
+    int rc       = onvif_resolve_bridge(req.controlUrl.c_str(), req.userid.c_str(), req.password.c_str(), wantMain, prior, &res);
     if (rc != ONVIF_BRIDGE_OK)
     {
         // [hikvision] ONVIF failed for a non-auth reason (unreachable / no ONVIF streams /
@@ -1045,6 +1100,8 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.onvif.token       = res.token;
     entry.onvif.user        = req.userid;
     entry.onvif.pass        = req.password;
+    entry.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+    PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in, entry.onvif);
 
     // Replace any existing camera with the same stable identity (idempotent re-onboard).
     RemoveCameraByDni(sid, /* purgePersistedTransports = */ false); // replace, camera stays
@@ -1066,6 +1123,8 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     out.videoCodec  = res.codec;
     out.hasPtz      = res.has_ptz != 0;
     out.hasAudioOut = res.has_audio_out != 0;
+    out.hasAudioIn  = res.has_audio_in != 0;
+    out.audioCodec  = res.audio_codec;
     ChipLogProgress(Camera, "CameraBridge: upsert dni=%s onboarded on endpoint %d", req.dni.c_str(), endpoint);
     return out;
 }
@@ -1109,8 +1168,21 @@ BridgeIpc::OpResult HandleIpcRemove(const std::string & dni, int endpoint)
 }
 
 // [single_bridge] Apply ONE default ONVIF login to EVERY camera (from the Matter Bridge
-// card): store + persist it, then re-resolve each camera with it. Per camera we fall back
-// to an anonymous resolve if the creds fail, so an anonymous camera is never broken.
+// card): store + persist it, then apply it to every camera. CONSISTENCY RULE: the
+// credentials the user entered are ALWAYS what each camera uses afterwards — there is NO
+// silent fallback to the camera's previous login and NO anonymous fallback. So the answer
+// to "which credentials is this camera using?" is always exactly "the ones last entered
+// here" (mirrored in default_creds and in every cameras.json entry), which is what the
+// operator can see. If the entered password is wrong, the stream then fails *with that
+// password* — a visible "fix the credentials" signal — instead of appearing to succeed
+// while a stale login quietly does the work.
+//
+// For ONVIF cameras we still re-resolve with the new creds to refresh the stream facts
+// (rtsp/ptz/token/snapshot). If that resolve fails (wrong password, or the camera is
+// momentarily offline) we keep the previously resolved stream URL but STILL swap in the
+// entered credentials. Direct-RTSP cameras (no control URL) keep their IP-derived URL and
+// are NOT re-probed here — each direct probe spends a Hikvision login-lock strike, and the
+// URL is stable — but their credentials are updated the same way.
 // Runs on the IPC thread (blocking SOAP off the Matter loop; endpoint mutations under StackLock).
 BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::string & pass)
 {
@@ -1118,56 +1190,62 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
     gDefaultUser = user;
     gDefaultPass = pass;
     SaveDefaultCreds();
-    ChipLogProgress(Camera, "CameraBridge: set_default_creds user='%s' pass=%s -> re-resolving all cameras",
+    ChipLogProgress(Camera, "CameraBridge: set_default_creds user='%s' pass=%s -> applying to all cameras",
                     user.c_str(), pass.empty() ? "(blank)" : "***");
 
-    // Snapshot identity/source of each camera so we don't iterate the live list while mutating it.
-    struct Snap { std::string dni, controlUrl, name, stream; };
-    std::vector<Snap> snap;
+    // Snapshot each camera's full entry so we don't iterate the live list while mutating it.
+    std::vector<CameraConfig::CameraEntry> snap;
     for (const auto & c : gBridgedCameras)
-    {
-        const auto & e = c->GetEntry();
-        snap.push_back({ e.dni, e.controlUrl, e.name, e.stream });
-    }
+        snap.push_back(c->GetEntry());
 
     int applied = 0;
     for (const auto & s : snap)
     {
-        if (s.controlUrl.empty())
-            continue;
-        int wantMain = (s.stream != "substream") ? 1 : 0;
-        onvif_resolved_bridge_t res;
-        std::string u = user, p = pass;
-        int rc = onvif_resolve_bridge(s.controlUrl.c_str(), u.c_str(), p.c_str(), wantMain, &res);
-        if (rc != ONVIF_BRIDGE_OK && !(user.empty() && pass.empty()))
+        // Start from the camera's current config and overwrite ONLY the credentials: the
+        // entered user/pass are unconditionally what this camera uses from now on.
+        CameraConfig::CameraEntry ne = s;
+        ne.onvif.user = user;
+        ne.onvif.pass = pass;
+
+        if (!s.controlUrl.empty())
         {
-            u.clear(); // creds rejected — fall back to anonymous so we never break a working camera
-            p.clear();
-            rc = onvif_resolve_bridge(s.controlUrl.c_str(), "", "", wantMain, &res);
+            // ONVIF camera: try to refresh the stream facts with the new creds.
+            // Basic-auth verdict is a firmware property, unchanged by a credential change:
+            // pass the existing verdict so this re-resolve does NOT re-probe RTSP (no extra
+            // login attempts, no lockout) and can never flip a good verdict because the new
+            // password happens to be wrong or an ONVIF-only account.
+            int wantMain = (s.stream != "substream") ? 1 : 0;
+            int prior    = s.onvif.needsBasicAuth ? 1 : 0;
+            onvif_resolved_bridge_t res;
+            int rc = onvif_resolve_bridge(s.controlUrl.c_str(), user.c_str(), pass.c_str(), wantMain, prior, &res);
+            if (rc == ONVIF_BRIDGE_OK)
+            {
+                ne.onvif.rtspUrl     = res.rtsp_url;
+                ne.onvif.ptzUrl      = res.ptz_url;
+                ne.onvif.snapshotUrl = res.snapshot_url;
+                ne.onvif.token       = res.token;
+                ne.onvif.needsBasicAuth = res.needs_basic_auth ? true : false; // == prior (passed through)
+                PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in,
+                                        ne.onvif);
+            }
+            else
+            {
+                // Resolve rejected/unreachable: keep the last-known stream URL but still
+                // apply the entered creds (already set above). A wrong password thus shows
+                // up as a failing stream, not as a silently-unchanged camera.
+                ChipLogError(Camera,
+                             "CameraBridge: set_default_creds re-resolve failed for %s (rc=%d) — applied "
+                             "entered creds, kept last-known stream URL",
+                             s.dni.c_str(), rc);
+            }
         }
-        if (rc != ONVIF_BRIDGE_OK)
-        {
-            ChipLogError(Camera, "CameraBridge: set_default_creds re-resolve failed for %s (rc=%d) — left unchanged",
-                         s.dni.c_str(), rc);
-            continue;
-        }
-        CameraConfig::CameraEntry ne;
-        ne.name          = s.name;
-        ne.dni           = s.dni;
-        ne.controlUrl    = s.controlUrl;
-        ne.stream        = s.stream.empty() ? std::string("mainstream") : s.stream;
-        ne.onvif.rtspUrl     = res.rtsp_url;
-        ne.onvif.ptzUrl      = res.ptz_url;
-        ne.onvif.snapshotUrl = res.snapshot_url;
-        ne.onvif.token       = res.token;
-        ne.onvif.user        = u;
-        ne.onvif.pass        = p;
-        RemoveCameraByDni(s.dni, /* purgePersistedTransports = */ false); // re-resolve, camera stays
+
+        RemoveCameraByDni(s.dni, /* purgePersistedTransports = */ false); // rebuild with the new creds
         if (AddCamera(ne) >= 0)
         {
             applied++;
-            ChipLogProgress(Camera, "CameraBridge: re-resolved %s with %s creds -> rtsp=%s user='%s'", s.dni.c_str(),
-                            u.empty() ? "anonymous" : "default", ne.onvif.rtspUrl.c_str(), u.c_str());
+            ChipLogProgress(Camera, "CameraBridge: applied creds to %s -> rtsp=%s user='%s'", s.dni.c_str(),
+                            ne.onvif.rtspUrl.c_str(), user.empty() ? "(anonymous)" : user.c_str());
         }
     }
     PersistCameras();

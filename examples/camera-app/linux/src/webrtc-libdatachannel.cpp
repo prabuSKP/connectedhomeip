@@ -467,7 +467,7 @@ public:
         if (mediaType == MediaType::Audio)
         {
             std::string audioMid = mid.empty() ? "audio" : mid;
-            rtc::Description::Audio aMedia(audioMid, rtc::Description::Direction::SendRecv);
+            rtc::Description::Audio aMedia(audioMid, rtc::Description::Direction::SendOnly);
             aMedia.addOpusCodec(payloadType);
             aMedia.setBitrate(kAudioBitRate);
             aMedia.addSSRC(kAudioSSRC, "audio-stream", "stream1", "audio-stream");

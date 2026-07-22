@@ -114,7 +114,8 @@ std::string UpsertResponse(const std::string & id, const OpResult & r)
     return "{\"v\":1,\"id\":\"" + Escape(id) + "\",\"ok\":true,\"status\":\"onboarded\",\"result\":{\"endpoint\":" +
         std::to_string(r.endpoint) + ",\"profiles\":" + std::to_string(r.profiles) + ",\"video_codec\":\"" +
         Escape(r.videoCodec) + "\",\"has_ptz\":" + (r.hasPtz ? "true" : "false") + ",\"has_audio_out\":" +
-        (r.hasAudioOut ? "true" : "false") + "}}";
+        (r.hasAudioOut ? "true" : "false") + ",\"has_audio_in\":" + (r.hasAudioIn ? "true" : "false") +
+        ",\"audio_codec\":\"" + Escape(r.audioCodec) + "\"}}";
 }
 
 std::string RemoveResponse(const std::string & id)

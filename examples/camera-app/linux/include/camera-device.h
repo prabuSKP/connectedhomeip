@@ -30,8 +30,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <gst/gst.h>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 #define STREAM_GST_DEST_IP "127.0.0.1"
 #define VIDEO_STREAM_GST_DEST_PORT 5000
@@ -82,6 +85,18 @@ constexpr const char * kDefaultVideoDevicePath = "/dev/video0";
 
 // Per-camera ONVIF connection config.  Populated from cameras.json (multi-camera
 // bridge) or from CLI options (single-camera backward-compat path in main.cpp).
+enum class InboundAudioCodec { kNone, kPcmu, kPcma, kOpus, kUnsupported };
+
+struct InboundAudioCapability
+{
+    bool verifiedByRtspSdp = false;
+    InboundAudioCodec codec = InboundAudioCodec::kNone;
+    uint32_t clockRateHz = 0;
+    uint8_t channels = 0;
+};
+
+// Per-camera ONVIF connection config.  Populated from cameras.json (multi-camera
+// bridge) or from CLI options (single-camera backward-compat path in main.cpp).
 struct OnvifConfig
 {
     std::string rtspUrl;     // RTSP stream URL, e.g. rtsp://192.168.1.100/live/ch00_0
@@ -92,6 +107,24 @@ struct OnvifConfig
     std::string pass;
     bool useTestSrc = false; // when true (rtspUrl empty), use a GStreamer test pattern
                              // instead of RTSP/V4L2 — for hardware-free multi-camera testing
+    bool needsBasicAuth = false; // this camera's RTSP Digest is broken (verified
+                             // Hikvision firmware bug: rejects a correct password,
+                             // but accepts the SAME credentials via Basic). Set from
+                             // onvif_resolved_bridge_t::needs_basic_auth /
+                             // rtsp_probe_result_t::used_basic_fallback during
+                             // onboarding. rtspsrc has no Basic fallback of its own
+                             // (unlike our onvif_rtsp_probe), so when true the video
+                             // pipeline must force Basic auth itself (see the
+                             // "before-send" hook in camera-device.cpp) or every
+                             // connection attempt fails with "Unauthorized" even
+                             // with the right password.
+    InboundAudioCapability audioCapability;
+
+    bool HasVerifiedAudio() const {
+        return audioCapability.verifiedByRtspSdp &&
+               (audioCapability.codec == InboundAudioCodec::kPcmu ||
+                audioCapability.codec == InboundAudioCodec::kPcma);
+    }
 };
 
 // Camera defined constants for Pan, Tilt, Zoom bounding values
@@ -349,11 +382,30 @@ public:
 
     void HandleSimulatedZoneStoppedEvent(uint16_t zoneId);
 
+    // Called from the appsink streaming thread for each video buffer. Feeds the RTSP no-data
+    // watchdog AND computes the frame's wall-clock timestamp, both under mWatchdogMutex (F1):
+    // the PTS-offset map is erased by the watchdog thread on pipeline restart, so streaming-
+    // thread and watchdog-thread accesses must share the lock. Returns true if the frame is
+    // to be forwarded (timestamp monotonic), with outTs/outFirstPts set.
+    bool HandleVideoBufferTimestamp(uint16_t videoStreamID, uint64_t rawPts, int64_t & outTs, int64_t & outFirstPts);
+    void SetAudioBranchLinked(bool linked);
+
+    // Kick one background snapshot refresh (detached worker thread, TTL-gated, never blocks).
+    // Called by CaptureSnapshot on every request (onvifOnly=false → full snapshot tier cascade)
+    // and once from Init() at endpoint creation (onvifOnly=true → ONLY the lightweight ONVIF
+    // curl, never the RTSP-decode tier) so the FIRST CaptureSnapshot after onboarding finds a
+    // warm cache instead of failing while the initial ONVIF fetch is still in flight.
+    void TriggerSnapshotRefresh(bool onvifOnly = false);
+
     // Audio playback pipeline methods
     CameraError StartAudioPlaybackStream();
     CameraError StopAudioPlaybackStream();
 
-    // Timestamp handling for video and audio streams
+    // Timestamp handling for video and audio streams.
+    // mVideoStreamPtsOffsetMs is read/written by the streaming-thread appsink callback AND
+    // erased by the watchdog's TearDownVideoPipeline on restart, so all accesses to it are
+    // guarded by mWatchdogMutex (the callback already takes that mutex each buffer). Without
+    // the guard, a watchdog restart of stream 1 racing stream 3's callback corrupts the map.
     std::map<uint16_t, int64_t> mVideoStreamPtsOffsetMs;
     std::map<uint16_t, int64_t> mAudioStreamPtsOffsetMs;
 
@@ -398,6 +450,69 @@ private:
     GstElement * CreateSnapshotPipeline(const std::string & device, int width, int height, int quality, int frameRate,
                                         const std::string & filename, CameraError & error);
     CameraError SetV4l2Control(uint32_t controlId, int value);
+
+    // Per-camera cached snapshot JPEG path (tmpfs, keyed on the RTSP URL).
+    std::string SnapshotCachePath() const;
+
+    // Pipeline lifecycle helpers shared by StartVideoStream/StopVideoStream and the RTSP
+    // watchdog's in-place restart. Neither touches the consumer ref-counts — callers own
+    // those. Both require mPipelineLifecycleMutex to be held.
+    CameraError BuildAndStartVideoPipeline(VideoStream & stream);
+    bool TearDownVideoPipeline(VideoStream & stream); // false = GStreamer state change failed
+
+    // ---- RTSP no-data watchdog -------------------------------------------------------------
+    // Field failure this recovers from: after a PushAV clip some cameras silently stall their
+    // RTSP stream (TCP stays ESTABLISHED, zero packets from port 554); the pipeline object
+    // stays "running" and, because the PushAV transport remains a registered consumer between
+    // clips, the ref-count never hits 0 so the stalled pipeline was never rebuilt. The
+    // watchdog thread (pure media layer — it never touches the CHIP stack) checks every
+    // running video pipeline: if the bus reports ERROR/EOS, or no buffer has arrived for
+    // kWatchdogNoDataSec (INCLUDING a pipeline that connects but never delivers a single
+    // frame — the common post-recording stall), it tears the pipeline down and rebuilds it
+    // in place under the live consumers. Consecutive failed rebuilds back off (doubling,
+    // capped) but retry forever — the camera may come back at any time and there is no other
+    // recovery path.
+    //
+    // Dormancy is driven by the SAME consumer refcount that keeps the pipeline alive
+    // (mVideoStreamConsumers), NOT by mActiveVideoStreams: the PushAV standing consumer must
+    // keep the watchdog awake, and mActiveVideoStreams is used elsewhere (snapshot contention)
+    // — the two must not be conflated or a PushAV-only stall goes unwatched.
+    void StartWatchdog(); // idempotent; spawns the thread on first pipeline start and wakes it
+    void StopWatchdog();  // idempotent; joins the thread (called from Shutdown + destructor)
+    void WatchdogLoop();
+    bool WatchdogCheckStreams(); // returns true while any video stream still has a consumer
+    // Note a video buffer arrival for the watchdog. Assumes mWatchdogMutex is held (the
+    // appsink callback holds it across the buffer's watchdog + PTS-offset bookkeeping).
+    void NoteVideoDataLocked(uint16_t videoStreamID);
+
+    static constexpr int kWatchdogPollSec           = 1;  // tick interval while pipelines run
+    static constexpr int kWatchdogNoDataSec         = 10; // no buffers for this long => restart
+    static constexpr int kWatchdogInitialBackoffSec = 5;
+    static constexpr int kWatchdogMaxBackoffSec     = 60;
+
+    // Serialises pipeline lifecycle (build/start/stop/rebuild). Start/Stop were historically
+    // invoked from Matter-thread contexts and from the media controller (WebRTC callback
+    // thread) without a CameraDevice-level lock; the watchdog thread adds a third mutator, so
+    // every lifecycle path now takes this mutex. Never held while calling into the CHIP stack.
+    std::mutex mPipelineLifecycleMutex;
+
+    struct WatchdogStreamState
+    {
+        std::chrono::steady_clock::time_point lastData;    // last buffer arrival (or pipeline (re)start)
+        std::chrono::steady_clock::time_point nextRestart; // backoff gate for the next rebuild
+        std::chrono::steady_clock::time_point pipelineStart; // time when pipeline was (re)built
+        int backoffSec = 0;                                // 0 = healthy (reset when data flows)
+    };
+    // Guards mWatchdogStreams AND mVideoStreamPtsOffsetMs (appsink streaming thread vs watchdog
+    // thread). Lock order: mPipelineLifecycleMutex -> mWatchdogMutex (never the reverse).
+    std::mutex mWatchdogMutex;
+    std::map<uint16_t, WatchdogStreamState> mWatchdogStreams;
+
+    std::thread mWatchdogThread;
+    std::mutex mWatchdogCvMutex;
+    std::condition_variable mWatchdogCv;
+    bool mWatchdogStop = false; // guarded by mWatchdogCvMutex
+    bool mWatchdogWake = false; // guarded by mWatchdogCvMutex; defeats the lost-wakeup race
 
     bool MatchClosestSnapshotParams(const VideoResolutionStruct & requested, VideoResolutionStruct & outResolution,
                                     chip::app::Clusters::CameraAvStreamManagement::ImageCodecEnum & outCodec);
@@ -444,6 +559,13 @@ private:
 
     // Audio playback pipeline specific members
     GstElement * mAudioPlaybackPipeline = nullptr;
+
+    // Per-stream audio delivery state (part of the shared RTSP pipeline)
+    bool mAudioBranchLinked = false;   // true when rtspsrc exposed a supported audio pad
+    bool mAudioDeliveryEnabled = false; // true when StartAudioStream has been called
+    bool mAudioPadTimeoutLogged = false; // true when pad timeout has been logged for current run
+    uint64_t mAudioEpoch = 0;          // shared timestamp epoch
+    uint64_t mAudioPtsOffset = 0;      // audio PTS running offset on restart
 };
 
 } // namespace Camera

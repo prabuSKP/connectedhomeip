@@ -165,6 +165,15 @@ PushAvStreamTransportManager::AllocatePushTransport(const TransportOptionsStruct
                     "PushAvStreamTransportManager, RegisterTransport for connectionID: [%u], videoStreams count: [%u], "
                     "audioStreams count: [%u]",
                     connectionID, static_cast<unsigned>(videoStreams.size()), static_cast<unsigned>(audioStreams.size()));
+    // NOTE: this registration is deliberately long-lived — the transport stays a media-controller
+    // consumer from AllocatePushTransport until DeallocatePushTransport, spanning the gaps
+    // BETWEEN clips ("Video stream N still has 1 consumer(s); keeping pipeline"). That keeps the
+    // camera pipeline running so motion clips can include pre-roll footage (maxPreRollLen feeds
+    // the PreRollBuffer continuously) and so a triggered recording starts on the next keyframe
+    // instead of waiting several seconds for a fresh RTSP negotiation. The cost: the on-demand
+    // ref-count never reaches 0 between clips, so a camera that silently stalls its RTSP stream
+    // after a clip (seen on DS-2CD122P-I3) is never torn down by the last-consumer path — the
+    // RTSP no-data watchdog in CameraDevice covers that case by rebuilding the pipeline in place.
     mMediaController->RegisterTransport(mTransportMap[connectionID].get(), videoStreams, audioStreams);
     mMediaController->SetPreRollLength(mTransportMap[connectionID].get(), mTransportMap[connectionID].get()->GetPreRollLength());
 

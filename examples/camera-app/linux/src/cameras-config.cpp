@@ -262,6 +262,27 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
         entry.onvif.token       = ExtractField(obj, "token");
         entry.onvif.user    = ExtractField(obj, "user");
         entry.onvif.pass    = ExtractField(obj, "pass");
+        entry.onvif.needsBasicAuth = (ExtractField(obj, "basic_auth") == "true"); // absent -> false (default: Digest)
+
+        std::string verifiedStr = ExtractField(obj, "audio_verified");
+        if (verifiedStr == "true")
+        {
+            entry.onvif.audioCapability.verifiedByRtspSdp = true;
+            std::string aCodec = ExtractField(obj, "audio_codec");
+            if (aCodec == "PCMU")
+                entry.onvif.audioCapability.codec = Camera::InboundAudioCodec::kPcmu;
+            else if (aCodec == "PCMA")
+                entry.onvif.audioCapability.codec = Camera::InboundAudioCodec::kPcma;
+            else if (aCodec == "OPUS")
+                entry.onvif.audioCapability.codec = Camera::InboundAudioCodec::kOpus;
+            else
+                entry.onvif.audioCapability.codec = Camera::InboundAudioCodec::kUnsupported;
+            
+            std::string rateStr = ExtractField(obj, "audio_rate");
+            entry.onvif.audioCapability.clockRateHz = rateStr.empty() ? 0 : std::atoi(rateStr.c_str());
+            std::string chanStr = ExtractField(obj, "audio_channels");
+            entry.onvif.audioCapability.channels = chanStr.empty() ? 0 : static_cast<uint8_t>(std::atoi(chanStr.c_str()));
+        }
 
         // "rtsp": "test" selects a hardware-free GStreamer test pattern for this
         // camera (used to validate multi-camera behaviour without a 2nd ONVIF cam).
@@ -320,8 +341,27 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
              << ", \"pass\": \"" << JsonEscape(c.onvif.pass) << "\""
              << ", \"control_url\": \"" << JsonEscape(c.controlUrl) << "\""
              << ", \"stream\": \"" << JsonEscape(streamVal) << "\""
-             << ", \"mode\": \"" << JsonEscape(modeVal) << "\" }"
-             << (i + 1 < cameras.size() ? "," : "") << "\n";
+             << ", \"mode\": \"" << JsonEscape(modeVal) << "\"";
+
+        if (c.onvif.needsBasicAuth)
+            file << ", \"basic_auth\": \"true\"";
+
+        if (c.onvif.audioCapability.verifiedByRtspSdp)
+        {
+            std::string aCodec = "Unsupported";
+            if (c.onvif.audioCapability.codec == Camera::InboundAudioCodec::kPcmu)
+                aCodec = "PCMU";
+            else if (c.onvif.audioCapability.codec == Camera::InboundAudioCodec::kPcma)
+                aCodec = "PCMA";
+            else if (c.onvif.audioCapability.codec == Camera::InboundAudioCodec::kOpus)
+                aCodec = "OPUS";
+
+            file << ", \"audio_verified\": \"true\""
+                 << ", \"audio_codec\": \"" << aCodec << "\""
+                 << ", \"audio_rate\": \"" << c.onvif.audioCapability.clockRateHz << "\""
+                 << ", \"audio_channels\": \"" << (int)c.onvif.audioCapability.channels << "\"";
+        }
+        file << " }" << (i + 1 < cameras.size() ? "," : "") << "\n";
     }
     file << "]\n";
     file.close();
