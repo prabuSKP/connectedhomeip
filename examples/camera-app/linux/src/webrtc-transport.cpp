@@ -220,12 +220,12 @@ void WebrtcTransport::Stop()
     mLocalAudioTrack = nullptr;
 }
 
-void WebrtcTransport::AddVideoTrack(const std::string & videoMid, int payloadType)
+void WebrtcTransport::AddVideoTrack(const std::string & videoMid, int payloadType, const std::string & codec)
 {
     if (mPeerConnection != nullptr)
     {
         // Adding local tracks to send video data to remote peer
-        mLocalVideoTrack = mPeerConnection->AddTrack(MediaType::Video, videoMid, payloadType);
+        mLocalVideoTrack = mPeerConnection->AddTrack(MediaType::Video, videoMid, payloadType, codec);
     }
 }
 

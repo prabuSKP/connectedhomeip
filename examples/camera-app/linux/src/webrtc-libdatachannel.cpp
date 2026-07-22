@@ -26,6 +26,7 @@ namespace {
 
 // Constants
 constexpr int kVideoH264PayloadType    = 96;
+constexpr int kVideoH265PayloadType    = 35; // observed SmartThings offer default for H265/90000
 constexpr int kVideoBitRate            = 3000;
 constexpr int kSSRC                    = 42;
 constexpr int kMaxFragmentSize         = 1188; // 1200 (max packet size) - 12 (RTP header size)
@@ -113,7 +114,9 @@ const char * GetGatheringStateStr(rtc::PeerConnection::GatheringState state)
 class LibDataChannelTrack : public WebRTCTrack
 {
 public:
-    LibDataChannelTrack(std::shared_ptr<rtc::Track> track, int payloadType = -1) : mTrack(track), mPayloadType(payloadType) {}
+    LibDataChannelTrack(std::shared_ptr<rtc::Track> track, int payloadType = -1, const std::string & videoCodec = "H264") :
+        mTrack(track), mPayloadType(payloadType), mVideoCodec(videoCodec)
+    {}
 
     ~LibDataChannelTrack()
     {
@@ -145,6 +148,44 @@ public:
 
         // Attach handler chain to the sending track
         mTrack->setMediaHandler(mPacketizer);
+        ChipLogProgress(Camera, "WEBRTC_CODEC: H.264 RTP packetizer initialized (payloadType=%d, mid=%s)", payloadType,
+                        mTrack->description().mid().c_str());
+    }
+
+    // Initialize libdatachannel's RTP packetizer for H.265. Mirrors InitH264Packetizer exactly:
+    // H265RtpPacketizer has an identical constructor signature (same NalUnit::Separator enum,
+    // same 90 kHz VideoClockRate) and derives from the same RtpPacketizer base, so the RTCP
+    // wiring below is codec-agnostic.
+    void InitH265Packetizer()
+    {
+        int payloadType = mPayloadType == -1 ? kVideoH265PayloadType : mPayloadType;
+        mRtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(kSSRC, "videosrc", payloadType, rtc::H265RtpPacketizer::ClockRate);
+        mRtpCfg->mid = mTrack->description().mid();
+
+        mPacketizer = std::make_shared<rtc::H265RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, mRtpCfg, kMaxFragmentSize);
+
+        mSr   = std::make_shared<rtc::RtcpSrReporter>(mRtpCfg);
+        mNack = std::make_shared<rtc::RtcpNackResponder>();
+        mPacketizer->addToChain(mSr);
+        mPacketizer->addToChain(mNack);
+
+        mTrack->setMediaHandler(mPacketizer);
+        ChipLogProgress(Camera, "WEBRTC_CODEC: H.265 RTP packetizer initialized (payloadType=%d, mid=%s)", payloadType,
+                        mTrack->description().mid().c_str());
+    }
+
+    // Picks the packetizer matching this track's real stream codec. Both are pure passthrough
+    // (raw NAL units in, RTP packets out) — no transcode either way.
+    void InitVideoPacketizer()
+    {
+        if (mVideoCodec == "H265")
+        {
+            InitH265Packetizer();
+        }
+        else
+        {
+            InitH264Packetizer();
+        }
     }
 
     void InitOpusPacketizer()
@@ -209,7 +250,7 @@ public:
             const std::string kind = mTrack->description().type();
             if (kind == "video" && !mVideoInitDone)
             {
-                InitH264Packetizer();
+                InitVideoPacketizer();
                 mVideoInitDone = true;
             }
             else if (kind == "audio" && !mAudioInitDone)
@@ -243,7 +284,7 @@ public:
             const std::string kind = mTrack->description().type();
             if (kind == "video" && !mVideoInitDone)
             {
-                InitH264Packetizer();
+                InitVideoPacketizer();
                 mVideoInitDone = true;
             }
             else if (kind == "audio" && !mAudioInitDone)
@@ -283,10 +324,12 @@ private:
     std::shared_ptr<rtc::Track> mTrack;
     int mPayloadType;
     int mAudioRTPSocket = -1;
+    std::string mVideoCodec; // "H264" or "H265" — selects Init{H264,H265}Packetizer() below
 
-    // For Video
+    // For Video. mPacketizer is held as the common RtpPacketizer base so either codec's
+    // packetizer (identical construction/RTCP-chain pattern) fits the same member.
     std::shared_ptr<rtc::RtpPacketizationConfig> mRtpCfg;
-    std::shared_ptr<rtc::H264RtpPacketizer> mPacketizer;
+    std::shared_ptr<rtc::RtpPacketizer> mPacketizer;
     std::shared_ptr<rtc::RtcpSrReporter> mSr;
     std::shared_ptr<rtc::RtcpNackResponder> mNack;
 
@@ -432,6 +475,10 @@ public:
         {
             return kVideoH264PayloadType;
         }
+        else if (codec == "H265")
+        {
+            return kVideoH265PayloadType;
+        }
         else if (codec == "opus")
         {
             return kOpusPayloadType;
@@ -451,17 +498,29 @@ public:
         }
     }
 
-    std::shared_ptr<WebRTCTrack> AddTrack(MediaType mediaType, const std::string & mid, int payloadType) override
+    std::shared_ptr<WebRTCTrack> AddTrack(MediaType mediaType, const std::string & mid, int payloadType,
+                                          const std::string & codec = "H264") override
     {
         if (mediaType == MediaType::Video)
         {
             std::string videoMid = mid.empty() ? "video" : mid;
             rtc::Description::Video vMedia(videoMid, rtc::Description::Direction::SendOnly);
-            vMedia.addH264Codec(payloadType);
+            // H264/H265 passthrough are both pure RTP repacketization (no transcode); only the
+            // SDP codec descriptor and RTP packetizer differ.
+            if (codec == "H265")
+            {
+                vMedia.addH265Codec(payloadType);
+            }
+            else
+            {
+                vMedia.addH264Codec(payloadType);
+            }
+            ChipLogProgress(Camera, "WEBRTC_CODEC: answer video track mid=%s codec=%s payloadType=%d", videoMid.c_str(),
+                            codec.c_str(), payloadType);
             vMedia.setBitrate(kVideoBitRate);
             vMedia.addSSRC(kSSRC, "video-stream", "stream1", "video-stream");
             auto track = mPeerConnection->addTrack(vMedia);
-            return std::make_shared<LibDataChannelTrack>(track, payloadType);
+            return std::make_shared<LibDataChannelTrack>(track, payloadType, codec);
         }
 
         if (mediaType == MediaType::Audio)

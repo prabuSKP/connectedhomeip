@@ -354,6 +354,21 @@ Protocols::InteractionModel::Status CameraAVStreamManager::VideoStreamAllocate(c
 
     if (!isRequestSupportedByAnyAvailableStream)
     {
+        // Live view is blocked here when the requested codec/resolution/framerate matches no
+        // declared stream. Codec mismatch (H.264 vs HEVC) is the usual cause — dump the request
+        // and the declared menu so a post-mortem needs no guessing (grep "VIDEO_ALLOC_REJECT").
+        std::string available;
+        for (const auto & stream : mCameraDeviceHAL->GetCameraHALInterface().GetAvailableVideoStreams())
+        {
+            available += " codec=" + std::to_string(static_cast<int>(stream.videoStreamParams.videoCodec));
+        }
+        ChipLogError(Camera,
+                     "VIDEO_ALLOC_REJECT: DynamicConstraintError — requested codec=%d res=%ux%u..%ux%u fps=%u..%u; "
+                     "declared streams:%s (0=H264 1=HEVC). Codec mismatch => re-onboard so the declared stream matches "
+                     "the camera's real codec.",
+                     static_cast<int>(allocateArgs.videoCodec), allocateArgs.minResolution.width,
+                     allocateArgs.minResolution.height, allocateArgs.maxResolution.width, allocateArgs.maxResolution.height,
+                     allocateArgs.minFrameRate, allocateArgs.maxFrameRate, available.empty() ? " (none)" : available.c_str());
         return Status::DynamicConstraintError;
     }
 

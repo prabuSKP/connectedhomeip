@@ -105,6 +105,10 @@ struct OnvifConfig
     std::string token;       // ONVIF profile token
     std::string user;
     std::string pass;
+    std::string videoCodec = "H264"; // real RTSP stream codec ("H264" | "H265"), detected from
+                                     // the SDP probe at onboard and persisted in cameras.json.
+                                     // Selects the depayloader/parse elements and the WebRTC
+                                     // packetizer; both codecs are pure passthrough (no transcode).
     bool useTestSrc = false; // when true (rtspUrl empty), use a GStreamer test pattern
                              // instead of RTSP/V4L2 — for hardware-free multi-camera testing
     bool needsBasicAuth = false; // this camera's RTSP Digest is broken (verified
@@ -377,6 +381,10 @@ public:
     // for multi-camera operation).  Call before Init().
     void SetOnvifConfig(const OnvifConfig & config) { mOnvifConfig = config; }
     const OnvifConfig & GetOnvifConfig() const { return mOnvifConfig; }
+
+    // CameraDeviceInterface: real RTSP-source codec ("H264" | "H265"), used by the WebRTC layer
+    // to select the matching depayloader/packetizer instead of assuming H264.
+    std::string GetVideoCodec() override { return mOnvifConfig.videoCodec; }
 
     void HandleSimulatedZoneTriggeredEvent(const std::vector<uint16_t> & zoneIds);
 

@@ -86,7 +86,10 @@ public:
     virtual void CreateAnswer()                                                                                  = 0;
     virtual void SetRemoteDescription(const std::string & sdp, SDPType type)                                     = 0;
     virtual void AddRemoteCandidate(const std::string & candidate, const std::string & mid)                      = 0;
-    virtual std::shared_ptr<WebRTCTrack> AddTrack(MediaType mediaType, const std::string & mid, int payloadType) = 0;
+    // codec only matters for MediaType::Video ("H264" or "H265"); audio tracks are always Opus
+    // regardless of the string passed.
+    virtual std::shared_ptr<WebRTCTrack> AddTrack(MediaType mediaType, const std::string & mid, int payloadType,
+                                                   const std::string & codec = "H264") = 0;
     virtual int GetPayloadType(const std::string & sdp, SDPType type, const std::string & codec) { return -1; };
 };
 

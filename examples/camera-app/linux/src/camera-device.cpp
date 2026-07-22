@@ -648,18 +648,28 @@ static void OnvifLinkRtspPadAV(GstElement * src, GstPad * newPad, gpointer user_
 
     if (media && g_strcmp0(media, "video") == 0)
     {
-        if (g_strcmp0(encoding, "H264") == 0 && ctx->videoDepay)
+        // Link the pad to whatever depayloader the pipeline was built with (rtph264depay or
+        // rtph265depay, chosen from the persisted codec). gst_pad_link's caps check succeeds
+        // when the stream encoding matches the depayloader and fails otherwise — either way we
+        // log the ACTUAL encoding, so an unexpected codec is never silently dropped (the old
+        // code hard-matched "H264" and skipped H.265 with no log at all).
+        if (ctx->videoDepay)
         {
             GstPad * sinkPad = gst_element_get_static_pad(ctx->videoDepay, "sink");
             if (sinkPad && !gst_pad_is_linked(sinkPad))
             {
                 if (gst_pad_link(newPad, sinkPad) == GST_PAD_LINK_OK)
                 {
-                    ChipLogProgress(Camera, "ONVIF: linked rtspsrc video pad → rtph264depay");
+                    ChipLogProgress(Camera, "ONVIF: linked rtspsrc video pad (encoding=%s) → depayloader",
+                                    encoding ? encoding : "unknown");
                 }
                 else
                 {
-                    ChipLogError(Camera, "ONVIF: failed to link video pad");
+                    ChipLogError(Camera,
+                                 "ONVIF: could not link video pad — stream encoding=%s does not match the "
+                                 "configured depayloader. The camera's real codec differs from what was detected; "
+                                 "re-onboard the camera to re-probe, or set its encoding to H.264/H.265.",
+                                 encoding ? encoding : "unknown");
                 }
             }
             if (sinkPad)
@@ -706,10 +716,15 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
     if (!mOnvifConfig.rtspUrl.empty())
     {
         const std::string onvifUrl = mOnvifConfig.rtspUrl;
+        // Codec is detected from the real RTSP SDP at onboard and persisted (mOnvifConfig.videoCodec).
+        // H.265 is the SAME zero-transcode passthrough as H.264 — only the RTP depayloader and the
+        // parser differ (rtph265depay/h265parse vs rtph264depay/h264parse); the compressed access
+        // units flow straight to the appsink untouched.
+        const bool   isH265        = (mOnvifConfig.videoCodec == "H265");
         GstElement * pipeline      = gst_pipeline_new("video-pipeline");
         GstElement * source        = gst_element_factory_make("rtspsrc", "source");
-        GstElement * depay         = gst_element_factory_make("rtph264depay", "depay");
-        GstElement * parse         = gst_element_factory_make("h264parse", "parse");
+        GstElement * depay         = gst_element_factory_make(isH265 ? "rtph265depay" : "rtph264depay", "depay");
+        GstElement * parse         = gst_element_factory_make(isH265 ? "h265parse" : "h264parse", "parse");
         GstElement * h264caps      = gst_element_factory_make("capsfilter", "h264caps");
         GstElement * appsink       = gst_element_factory_make("appsink", "appsink");
 
@@ -719,7 +734,12 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
         };
         if (GstreamerPipepline::isGstElementsNull(onvifElements))
         {
-            ChipLogError(Camera, "ONVIF: not all video elements could be created.");
+            // Name the codec: for H.265 the usual cause is a hub GStreamer lacking rtph265depay
+            // (gst-plugins-good) or h265parse (gst-plugins-bad). Without those the H.265 pipeline
+            // cannot be built and live view is impossible until the plugins are deployed.
+            ChipLogError(Camera, "ONVIF: not all %s video elements could be created (depay=%p parse=%p) — %s",
+                         isH265 ? "H.265" : "H.264", (void *) depay, (void *) parse,
+                         isH265 ? "hub may be missing rtph265depay/h265parse plugins" : "check GStreamer install");
             GstreamerPipepline::unrefGstElements(pipeline, source, depay, parse, h264caps, appsink);
             error = CameraError::ERROR_INIT_FAILED;
             return nullptr;
@@ -746,9 +766,12 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
                                   static_cast<GConnectFlags>(0));
             ChipLogProgress(Camera, "ONVIF: forcing Basic RTSP auth (Digest was rejected but Basic accepted at probe time)");
         }
-        // h264parse: emit byte-stream access units and repeat SPS/PPS
+        // h264parse/h265parse: emit byte-stream access units and repeat the parameter sets
+        // (SPS/PPS, plus VPS for H.265) inline via config-interval=-1 — needed for keyframe
+        // caching and for a decoder joining mid-stream.
         g_object_set(parse, "config-interval", -1, nullptr);
-        GstCaps * outCaps = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "byte-stream",
+        GstCaps * outCaps = gst_caps_new_simple(isH265 ? "video/x-h265" : "video/x-h264",
+                                                "stream-format", G_TYPE_STRING, "byte-stream",
                                                 "alignment", G_TYPE_STRING, "au", nullptr);
         g_object_set(h264caps, "caps", outCaps, nullptr);
         gst_caps_unref(outCaps);
@@ -845,8 +868,8 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
                               [](gpointer data, GClosure *) { delete static_cast<OnvifPadLinkContext *>(data); },
                               static_cast<GConnectFlags>(0));
 
-        ChipLogProgress(Camera, "Video pipeline: ONVIF/RTSP source %s (H.264 passthrough%s)", onvifUrl.c_str(),
-                        includeAudio ? " + Audio PCMU/PCMA->Opus" : "");
+        ChipLogProgress(Camera, "Video pipeline: ONVIF/RTSP source %s (%s passthrough%s)", onvifUrl.c_str(),
+                        isH265 ? "H.265" : "H.264", includeAudio ? " + Audio PCMU/PCMA->Opus" : "");
         return pipeline;
     }
 
@@ -2932,11 +2955,20 @@ void CameraDevice::HandleSimulatedZoneStoppedEvent(uint16_t zoneId)
 
 void CameraDevice::InitializeVideoStreams()
 {
+    // Declare the codec the controller can actually request for THIS camera. VideoStreamAllocate
+    // is gated on an exact codec match against these declared streams (see
+    // CameraAVStreamManager::VideoStreamAllocate -> VideoStream::IsCompatible); if we always
+    // declared kH264 here, an H.265 camera's allocate would still "succeed" against this fake
+    // menu (SmartThings' offer includes both codecs' rtpmap regardless), but the cluster's
+    // AllocatedVideoStreams state would misreport the real codec. Mirrors the same fix already
+    // applied for audio (see InitializeAudioStreams: publish what's actually available).
+    const VideoCodecEnum codec = (mOnvifConfig.videoCodec == "H265") ? VideoCodecEnum::kHevc : VideoCodecEnum::kH264;
+
     // Create a video stream with a max resolution of 720p and max frame rate of
     // 60 fps
     VideoStream videoStream1 = { { 1 /* Id */,
                                    StreamUsageEnum::kLiveView /* StreamUsage */,
-                                   VideoCodecEnum::kH264,
+                                   codec,
                                    kMinVideoFrameRate /* MinFrameRate */,
                                    k60fpsVideoFrameRate /* MaxFrameRate */,
                                    { kMinResolutionWidth, kMinResolutionHeight } /* MinResolution */,
@@ -2956,7 +2988,7 @@ void CameraDevice::InitializeVideoStreams()
     // of 720p
     VideoStream videoStream2 = { { 2 /* Id */,
                                    StreamUsageEnum::kLiveView /* StreamUsage */,
-                                   VideoCodecEnum::kH264,
+                                   codec,
                                    k60fpsVideoFrameRate /* MinFrameRate */,
                                    kMaxVideoFrameRate /* MaxFrameRate */,
                                    { k720pResolutionWidth, k720pResolutionHeight } /* MinResolution */,
@@ -2976,7 +3008,7 @@ void CameraDevice::InitializeVideoStreams()
     // Create a video stream for the full range(fps, resolution, bitrate) supported by the camera.
     VideoStream videoStream3 = { { 3 /* Id */,
                                    StreamUsageEnum::kLiveView /* StreamUsage */,
-                                   VideoCodecEnum::kH264,
+                                   codec,
                                    kMinVideoFrameRate /* MinFrameRate */,
                                    kMaxVideoFrameRate /* MaxFrameRate */,
                                    { kMinResolutionWidth, kMinResolutionHeight } /* MinResolution */,
@@ -2992,6 +3024,13 @@ void CameraDevice::InitializeVideoStreams()
                                  nullptr };
 
     mVideoStreams.push_back(videoStream3);
+
+    // The controller's VideoStreamAllocate is gated on an exact codec match against these
+    // declared streams. If live view fails with DynamicConstraintError (0xcf) on video, this
+    // is the line to check: the declared codec here MUST equal the camera's real stream codec.
+    ChipLogProgress(Camera, "CAM_CODEC: declared %zu video stream(s) as codec=%s (from onvifConfig.videoCodec='%s')",
+                    mVideoStreams.size(), (codec == VideoCodecEnum::kHevc) ? "HEVC/H.265" : "H.264",
+                    mOnvifConfig.videoCodec.c_str());
 }
 
 void CameraDevice::InitializeAudioStreams()

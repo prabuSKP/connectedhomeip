@@ -263,6 +263,10 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
         entry.onvif.user    = ExtractField(obj, "user");
         entry.onvif.pass    = ExtractField(obj, "pass");
         entry.onvif.needsBasicAuth = (ExtractField(obj, "basic_auth") == "true"); // absent -> false (default: Digest)
+        {
+            std::string vc = ExtractField(obj, "video_codec"); // absent -> H264 (older files / default)
+            entry.onvif.videoCodec = vc.empty() ? std::string("H264") : vc;
+        }
 
         std::string verifiedStr = ExtractField(obj, "audio_verified");
         if (verifiedStr == "true")
@@ -345,6 +349,11 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
 
         if (c.onvif.needsBasicAuth)
             file << ", \"basic_auth\": \"true\"";
+
+        // Persist the real stream codec so the pipeline picks the right depayloader on reboot
+        // without re-probing (only write non-default to keep older-style files clean).
+        if (!c.onvif.videoCodec.empty() && c.onvif.videoCodec != "H264")
+            file << ", \"video_codec\": \"" << JsonEscape(c.onvif.videoCodec) << "\"";
 
         if (c.onvif.audioCapability.verifiedByRtspSdp)
         {

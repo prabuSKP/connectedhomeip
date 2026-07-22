@@ -19,6 +19,7 @@
 #pragma once
 #include "camera-avstream-controller.h"
 #include "media-controller.h"
+#include <string>
 #include <app/clusters/camera-av-settings-user-level-management-server/CameraAvSettingsUserLevelManagementCluster.h>
 #include <app/clusters/camera-av-stream-management-server/CameraAVStreamManagementCluster.h>
 #include <app/clusters/chime-server/chime-server.h>
@@ -146,6 +147,11 @@ public:
 
     // Getter for PushAVStreamTransport Delegate
     virtual chip::app::Clusters::PushAvStreamTransportDelegate & GetPushAVTransportDelegate() = 0;
+
+    // Getter for the real (RTSP-source) video codec this camera streams — "H264" or "H265".
+    // Both are pure GStreamer/WebRTC passthrough (no transcode); the WebRTC layer uses this to
+    // pick the matching depayloader/packetizer instead of assuming H264.
+    virtual std::string GetVideoCodec() = 0;
 
     // Class defining the Camera HAL interface
     class CameraHALInterface

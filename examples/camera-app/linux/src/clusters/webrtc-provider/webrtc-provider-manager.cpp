@@ -510,13 +510,18 @@ CHIP_ERROR WebRTCProviderManager::HandleProvideOffer(const ProvideOfferRequestAr
     auto peerConnection  = transport->GetPeerConnection();
     std::string audioMid = ExtractMidFromSdp(args.sdp, "audio");
     std::string videoMid = ExtractMidFromSdp(args.sdp, "video");
-    int videoPt          = peerConnection->GetPayloadType(args.sdp, SDPType::Offer, /*codec*/ "H264");
+    // The camera's real stream codec ("H264" or "H265") — SmartThings offers both payload types
+    // in the SDP, so we must look up the one matching what this camera actually sends, not
+    // always H264.
+    std::string videoCodec = (mCameraDevice != nullptr) ? mCameraDevice->GetVideoCodec() : "H264";
+    int videoPt             = peerConnection->GetPayloadType(args.sdp, SDPType::Offer, videoCodec);
     int audioPt          = peerConnection->GetPayloadType(args.sdp, SDPType::Offer, /*codec*/ "opus");
 
     ChipLogProgress(Camera, "Extracted audioMid: %s, payloadType: %d", audioMid.c_str(), audioPt);
-    ChipLogProgress(Camera, "Extracted videoMid: %s, payloadType: %d", videoMid.c_str(), videoPt);
+    ChipLogProgress(Camera, "Extracted videoMid: %s, payloadType: %d, codec: %s", videoMid.c_str(), videoPt,
+                     videoCodec.c_str());
 
-    transport->AddVideoTrack(videoMid, videoPt);
+    transport->AddVideoTrack(videoMid, videoPt, videoCodec);
     if (!audioStreams.empty())
     {
         transport->AddAudioTrack(audioMid, audioPt);

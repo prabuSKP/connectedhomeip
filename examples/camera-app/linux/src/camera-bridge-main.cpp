@@ -521,6 +521,13 @@ int AddCamera(const CameraConfig::CameraEntry & entry)
     int endpoint = static_cast<int>(cam->GetEndpointId());
     gBridgedCameras.push_back(std::move(cam));
     gCameraCount.store(gBridgedCameras.size());
+    // One greppable per-camera summary of the codec/auth verdict that will drive the live-view
+    // pipeline and WebRTC packetizer. If live view later fails, this is the first line to check:
+    // it must show the camera's REAL stream codec (grep "CAM_CODEC").
+    ChipLogProgress(Camera, "CAM_CODEC: camera '%s' (dni=%s) endpoint=%d video_codec=%s needs_basic_auth=%d rtsp=%s",
+                    entry.name.c_str(), entry.dni.c_str(), endpoint,
+                    entry.onvif.videoCodec.empty() ? "H264(default)" : entry.onvif.videoCodec.c_str(),
+                    entry.onvif.needsBasicAuth ? 1 : 0, entry.onvif.rtspUrl.c_str());
     return endpoint;
 }
 
@@ -600,6 +607,39 @@ int KnownBasicAuth(const std::string & sid)
     return -1;
 }
 
+// The real stream codec is firmware-stable and detected once (from the SDP probe) at fresh
+// onboard, exactly like needsBasicAuth. Return the already-known codec for a bridged camera,
+// or "" if it is not currently bridged (fresh onboard -> use the just-probed value).
+std::string KnownVideoCodec(const std::string & sid)
+{
+    for (const auto & cam : gBridgedCameras)
+        if (StableCameraId(cam->GetEntry().dni) == sid)
+            return cam->GetEntry().onvif.videoCodec;
+    return {};
+}
+
+// Pick the sticky video codec when (re)building an entry.
+//   prior < 0  => fresh onboard: the RTSP probe just ran and read the REAL SDP, so trust
+//                 probedCodec (res.codec).
+//   prior >= 0 => re-resolve / credential change / IP move: the probe did NOT run, so
+//                 res.codec is only ONVIF metadata (not guaranteed to match the live stream)
+//                 and must be ignored. Keep the camera's ALREADY-KNOWN codec: the in-hand
+//                 entry's value first — this is the ONLY reliable source at BOOT, where no
+//                 endpoints exist yet so the gBridgedCameras lookup would come back empty and
+//                 wrongly default a persisted H.265 camera back to H.264 — then the live
+//                 bridged camera, then H264 as a last resort.
+// currentKnown: the existing entry's videoCodec when the caller has it in hand (re-resolve of a
+//               known camera); pass "" for a fresh entry that has no prior value.
+std::string PickVideoCodec(int prior, const char * probedCodec, const std::string & currentKnown, const std::string & sid)
+{
+    if (prior < 0 && probedCodec && probedCodec[0])
+        return probedCodec;
+    if (!currentKnown.empty())
+        return currentKnown;
+    std::string known = KnownVideoCodec(sid);
+    return known.empty() ? std::string("H264") : known;
+}
+
 // Persist the current camera list to cameras.json so IPC-added cameras survive a
 // restart. Called on the IPC thread after each successful add/remove.
 void PersistCameras()
@@ -649,6 +689,9 @@ bool ResolveDiscoveredCamera(const onvif_discovered_t & d, const std::string & s
     e.onvif.user        = cu;
     e.onvif.pass        = cp;
     e.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+    // Fresh WS-D onboard entry: no in-hand prior codec (currentKnown=""). prior<0 uses the
+    // probe; an already-bridged sid falls back to the live camera inside PickVideoCodec.
+    e.onvif.videoCodec  = PickVideoCodec(prior, res.codec, /*currentKnown=*/"", sid);
     return true;
 }
 
@@ -682,6 +725,14 @@ bool ReresolveMovedCamera(const onvif_discovered_t & d, CameraConfig::CameraEntr
     entry.onvif.user        = cu;
     entry.onvif.pass        = cp;
     entry.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+    // Same reasoning as needsBasicAuth above: the real stream codec is a firmware property,
+    // unchanged by an IP move alone — prior >= 0 here so this always keeps the known value
+    // (no fresh probe ran), never trusting a stale ONVIF-metadata guess in res.codec. Pass the
+    // in-hand persisted codec as currentKnown: this runs at BOOT (gBridgedCameras still empty),
+    // so the in-hand value is the only reliable source — without it a moved H.265 camera would
+    // wrongly reset to H.264. (Captured before the assignment overwrites the field.)
+    const std::string priorCodec = entry.onvif.videoCodec;
+    entry.onvif.videoCodec = PickVideoCodec(prior, res.codec, priorCodec, StableCameraId(entry.dni));
     return true;
 }
 
@@ -872,6 +923,8 @@ DiscoverResult RunDiscovery(std::vector<CameraConfig::CameraEntry> & list, bool 
             e.onvif.user        = cu;
             e.onvif.pass        = cp;
             e.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+            // Fresh onboard: the probe ran (prior=-1), so trust res.codec; no in-hand prior.
+            e.onvif.videoCodec     = PickVideoCodec(-1, res.codec, /*currentKnown=*/"", e.dni);
             PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in, e.onvif);
             ChipLogProgress(Camera, "CameraBridge: mDNS+ONVIF resolved '%s' (%s) rtsp=%s", e.name.c_str(),
                             e.dni.c_str(), e.onvif.rtspUrl.c_str());
@@ -1101,6 +1154,10 @@ BridgeIpc::OpResult HandleIpcUpsert(const BridgeIpc::UpsertRequest & req)
     entry.onvif.user        = req.userid;
     entry.onvif.pass        = req.password;
     entry.onvif.needsBasicAuth = res.needs_basic_auth ? true : false;
+    // Fresh IPC entry: no in-hand prior codec. A brand-new camera has prior<0 (probe ran, use
+    // res.codec); a re-onboard of a still-bridged camera has prior>=0 and falls back to the live
+    // bridged camera's codec inside PickVideoCodec (runtime path — gBridgedCameras is populated).
+    entry.onvif.videoCodec     = PickVideoCodec(prior, res.codec, /*currentKnown=*/"", sid);
     PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in, entry.onvif);
 
     // Replace any existing camera with the same stable identity (idempotent re-onboard).
@@ -1225,6 +1282,12 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
                 ne.onvif.snapshotUrl = res.snapshot_url;
                 ne.onvif.token       = res.token;
                 ne.onvif.needsBasicAuth = res.needs_basic_auth ? true : false; // == prior (passed through)
+                // Same reasoning: the real stream codec is a firmware property, unchanged by a
+                // credential change alone. prior >= 0 here so this always keeps the known value —
+                // ne started as a copy of the snapshot entry, so ne.onvif.videoCodec IS the
+                // camera's existing codec; pass it as currentKnown (robust even if the camera
+                // isn't in gBridgedCameras at this instant).
+                ne.onvif.videoCodec = PickVideoCodec(prior, res.codec, ne.onvif.videoCodec, StableCameraId(s.dni));
                 PopulateAudioCapability(res.audio_codec, res.audio_rate, res.audio_channels, res.has_audio_in,
                                         ne.onvif);
             }
