@@ -2955,14 +2955,20 @@ void CameraDevice::HandleSimulatedZoneStoppedEvent(uint16_t zoneId)
 
 void CameraDevice::InitializeVideoStreams()
 {
-    // Declare the codec the controller can actually request for THIS camera. VideoStreamAllocate
-    // is gated on an exact codec match against these declared streams (see
-    // CameraAVStreamManager::VideoStreamAllocate -> VideoStream::IsCompatible); if we always
-    // declared kH264 here, an H.265 camera's allocate would still "succeed" against this fake
-    // menu (SmartThings' offer includes both codecs' rtpmap regardless), but the cluster's
-    // AllocatedVideoStreams state would misreport the real codec. Mirrors the same fix already
-    // applied for audio (see InitializeAudioStreams: publish what's actually available).
-    const VideoCodecEnum codec = (mOnvifConfig.videoCodec == "H265") ? VideoCodecEnum::kHevc : VideoCodecEnum::kH264;
+    // Declare the Matter VideoStream codec as H.264 ALWAYS — even for a camera that really
+    // streams H.265. This is deliberate and required for interop: the SmartThings controller
+    // (and hub-core) always sends VideoStreamAllocate with codec=H264 — see the forked
+    // matter-switch driver's video_stream_defaults.codec, hardcoded to VideoCodecEnum.H264 — and
+    // our VideoStreamAllocate is gated on an EXACT codec match (VideoStream::IsCompatible).
+    // Declaring kHevc here would make that H264 allocate fail with DynamicConstraintError and
+    // block live view (VIDEO_ALLOC_REJECT). The declared codec is only a handshake label; it does
+    // NOT drive the media. The real H.265 is delivered downstream, independent of this value: the
+    // GStreamer pipeline (rtph265depay/h265parse) and the WebRTC answer (addH265Codec +
+    // H265RtpPacketizer) both key on mOnvifConfig.videoCodec. So H264-declared + H.265-streamed
+    // interops correctly. (Verified path: on the H.264-declared build, VideoStreamAllocate
+    // succeeded for the real-H.265 fleet; only the pipeline was wrong — which is what this feature
+    // fixes.)
+    const VideoCodecEnum codec = VideoCodecEnum::kH264;
 
     // Create a video stream with a max resolution of 720p and max frame rate of
     // 60 fps
@@ -3025,12 +3031,14 @@ void CameraDevice::InitializeVideoStreams()
 
     mVideoStreams.push_back(videoStream3);
 
-    // The controller's VideoStreamAllocate is gated on an exact codec match against these
-    // declared streams. If live view fails with DynamicConstraintError (0xcf) on video, this
-    // is the line to check: the declared codec here MUST equal the camera's real stream codec.
-    ChipLogProgress(Camera, "CAM_CODEC: declared %zu video stream(s) as codec=%s (from onvifConfig.videoCodec='%s')",
-                    mVideoStreams.size(), (codec == VideoCodecEnum::kHevc) ? "HEVC/H.265" : "H.264",
-                    mOnvifConfig.videoCodec.c_str());
+    // Streams are declared H.264 for the controller's allocate handshake (see the long note
+    // above); the REAL media codec is mOnvifConfig.videoCodec, delivered via the GStreamer
+    // pipeline + WebRTC SDP. If live view fails, correlate this with WEBRTC_CODEC (the codec the
+    // SDP answer actually advertised) — that, not this handshake label, is what reaches the app.
+    ChipLogProgress(Camera,
+                    "CAM_CODEC: declared %zu video stream(s) as H.264 for the allocate handshake; real stream "
+                    "codec=%s (delivered via pipeline + WebRTC SDP)",
+                    mVideoStreams.size(), mOnvifConfig.videoCodec.c_str());
 }
 
 void CameraDevice::InitializeAudioStreams()
