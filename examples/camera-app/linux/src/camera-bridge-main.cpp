@@ -1303,7 +1303,22 @@ BridgeIpc::OpResult HandleSetDefaultCreds(const std::string & user, const std::s
             }
         }
 
-        RemoveCameraByDni(s.dni, /* purgePersistedTransports = */ false); // rebuild with the new creds
+        // Replace = remove-then-add. Every entry in `snap` was just read from the live set, so
+        // the remove MUST match one; if it does not (e.g. an empty/duplicate dni that
+        // RemoveCameraByDni can't key on), adding anyway would DUPLICATE the camera — and since
+        // this loop runs on every set_default_creds, the duplicates compound until all endpoint
+        // slots are exhausted. Guard: only add the rebuilt camera when the old one was actually
+        // removed. (With the CLI camera now carrying a stable dni, this guard should never trip;
+        // it's here so no future identity-less camera can trigger the same storm.)
+        bool removed = RemoveCameraByDni(s.dni, /* purgePersistedTransports = */ false);
+        if (!removed)
+        {
+            ChipLogError(Camera,
+                         "CameraBridge: set_default_creds could not remove camera dni='%s' (rtsp=%s) — skipping re-add "
+                         "to avoid a duplicate endpoint",
+                         s.dni.c_str(), s.onvif.rtspUrl.c_str());
+            continue;
+        }
         if (AddCamera(ne) >= 0)
         {
             applied++;
@@ -1541,8 +1556,15 @@ void ApplicationInit()
         if (opts.cameraOnvifToken.HasValue())  entry.onvif.token   = opts.cameraOnvifToken.Value();
         if (opts.cameraOnvifUser.HasValue())   entry.onvif.user    = opts.cameraOnvifUser.Value();
         if (opts.cameraOnvifPass.HasValue())   entry.onvif.pass    = opts.cameraOnvifPass.Value();
-        ChipLogProgress(Camera, "CameraBridge: no cameras.json — single-camera CLI fallback (rtsp=%s)",
-                        entry.onvif.rtspUrl.c_str());
+        // Assign a STABLE, non-empty dni derived from the RTSP host. A camera with an empty dni
+        // cannot be deduped or removed (StableCameraId("")=="" and RemoveCameraByDni("") no-ops),
+        // so any later replace path (notably set_default_creds, which removes-then-re-adds every
+        // camera) would spawn a fresh duplicate on each call and eventually exhaust all 16
+        // endpoint slots. Keying the CLI camera on its host makes remove/replace idempotent.
+        std::string cliHost = HostFromUrl(entry.onvif.rtspUrl);
+        entry.dni = cliHost.empty() ? std::string("cli-camera") : (std::string("cli-") + cliHost);
+        ChipLogProgress(Camera, "CameraBridge: no cameras.json — single-camera CLI fallback (dni=%s rtsp=%s)",
+                        entry.dni.c_str(), entry.onvif.rtspUrl.c_str());
         cameraList.push_back(std::move(entry));
     }
     else if (cameraList.empty())
