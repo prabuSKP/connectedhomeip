@@ -19,8 +19,13 @@
 #include "webrtc-abstract.h"
 #include <Options.h>
 #include <arpa/inet.h>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <lib/support/logging/CHIPLogging.h>
 #include <rtc/rtc.hpp>
+#include <sys/stat.h>
 
 namespace {
 
@@ -259,6 +264,7 @@ public:
                 mAudioInitDone = true;
             }
             // Feed RAW H.264 access unit. Packetizer does NAL split, FU-A/STAP-A, RTP headers, marker bit, SR/NACK.
+            TraceH265Video(data);
             rtc::binary frame(data.size());
             std::memcpy(frame.data(), data.data(), data.size());
             mTrack->send(std::move(frame));
@@ -293,9 +299,15 @@ public:
                 mAudioInitDone = true;
             }
             // Feed RAW H.264 access unit. Packetizer does NAL split, FU-A/STAP-A, RTP headers, marker bit, SR/NACK.
+            TraceH265Video(data);
             rtc::binary frame(data.size());
             std::memcpy(frame.data(), data.data(), data.size());
-            rtc::FrameInfo info(timestamp);
+            // `timestamp` is in MILLISECONDS (CameraDevice::HandleVideoBufferTimestamp). The
+            // FrameInfo(uint32_t) overload takes raw RTP clock ticks — feeding ms there stamps the
+            // wire at 1 kHz instead of the negotiated rate (90 kHz video / 48 kHz Opus), compressing
+            // stream time ~90×. The chrono overload stores seconds and lets libdatachannel scale by
+            // each track's own clockRate (rtppacketizer.cpp secondsToTimestamp), correct for both.
+            rtc::FrameInfo info(std::chrono::duration<double, std::milli>(static_cast<double>(timestamp)));
             mTrack->sendFrame(std::move(frame), info);
         }
         catch (const std::exception & e)
@@ -317,6 +329,141 @@ public:
     }
 
 private:
+    // ---- H.265 TX tracing (grep "CAM_H265_TX"): prove the hub emits well-formed H.265 ----
+    // Parses the Annex-B access unit handed to the packetizer and logs its NAL breakdown, whether
+    // the parameter sets (VPS/SPS/PPS) and a keyframe are present, and how many RTP packets it
+    // fragments into. If the trigger file /data/onvif-bridge/h265dump exists, also writes the raw
+    // elementary stream to /data/log/h265-tx-<mid>.265 (pull it and decode offline to prove the
+    // content itself is valid). H.265 only; logs the first frames of a session + every keyframe.
+    static const char * H265NalName(uint8_t t)
+    {
+        switch (t)
+        {
+        case 0:
+        case 1:
+            return "TRAIL";
+        case 19:
+            return "IDR_W_RADL";
+        case 20:
+            return "IDR_N_LP";
+        case 21:
+            return "CRA";
+        case 32:
+            return "VPS";
+        case 33:
+            return "SPS";
+        case 34:
+            return "PPS";
+        case 35:
+            return "AUD";
+        case 39:
+        case 40:
+            return "SEI";
+        default:
+            return "NAL";
+        }
+    }
+
+    void TraceH265Video(const chip::ByteSpan & data)
+    {
+        if (mVideoCodec != "H265")
+            return;
+        const uint8_t * p = data.data();
+        const size_t n    = data.size();
+        const int frameNo = mVideoFrameCount++;
+        const std::string mid = mTrack ? std::string(mTrack->description().mid()) : std::string("?");
+
+        auto isStart = [&](size_t k, size_t & scLen) -> bool {
+            if (k + 3 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 1)
+            {
+                scLen = 3;
+                return true;
+            }
+            if (k + 4 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 0 && p[k + 3] == 1)
+            {
+                scLen = 4;
+                return true;
+            }
+            return false;
+        };
+
+        bool hasVps = false, hasSps = false, hasPps = false, keyframe = false;
+        int nalCount = 0, rtpPkts = 0;
+        char list[256];
+        size_t listLen = 0;
+        size_t i       = 0;
+        while (i < n)
+        {
+            size_t scLen = 0;
+            if (!isStart(i, scLen))
+            {
+                i++;
+                continue;
+            }
+            size_t nalStart = i + scLen;
+            size_t j        = nalStart;
+            while (j < n)
+            {
+                size_t sc2 = 0;
+                if (isStart(j, sc2))
+                    break;
+                j++;
+            }
+            size_t nalLen = j - nalStart;
+            if (nalLen >= 2)
+            {
+                uint8_t t = (p[nalStart] >> 1) & 0x3F;
+                nalCount++;
+                hasVps |= (t == 32);
+                hasSps |= (t == 33);
+                hasPps |= (t == 34);
+                keyframe |= (t >= 16 && t <= 23);
+                rtpPkts += (nalLen > (size_t) kMaxFragmentSize)
+                    ? (int) ((nalLen + kMaxFragmentSize - 1) / kMaxFragmentSize)
+                    : 1;
+                if (nalCount <= 12 && listLen + 40 < sizeof(list))
+                {
+                    int w = std::snprintf(list + listLen, sizeof(list) - listLen, "%s(%u):%zu ", H265NalName(t), t, nalLen);
+                    if (w > 0)
+                        listLen += (size_t) w;
+                }
+            }
+            i = j;
+        }
+
+        if (frameNo < 150 || keyframe)
+            // rtpPktsMax = pre-aggregation upper bound (1/small NAL + FU count); the packetizer's
+            // AP aggregation (fork change in h265rtppacketizer.cpp) can merge small NALs into
+            // fewer actual packets — a whole keyframe often ships as ONE AP packet.
+            ChipLogProgress(Camera,
+                            "CAM_H265_TX mid=%s frame#%d auSize=%zu nals=%d [%s] KEY=%d vps=%d sps=%d pps=%d ~rtpPktsMax=%d",
+                            mid.c_str(), frameNo, n, nalCount, list, keyframe, hasVps, hasSps, hasPps, rtpPkts);
+
+        // Raw elementary-stream dump (offline decode proof) — only if trigger file exists.
+        if (frameNo == 0)
+        {
+            struct stat st;
+            if (::stat("/data/onvif-bridge/h265dump", &st) == 0)
+            {
+                char path[256];
+                std::snprintf(path, sizeof(path), "/data/log/h265-tx-%s.265", mid.c_str());
+                mH265Dump = std::fopen(path, "wb");
+                if (mH265Dump)
+                    ChipLogProgress(Camera, "CAM_H265_TX dumping raw elementary stream to %s (cap 8MB)", path);
+            }
+        }
+        if (mH265Dump && mH265DumpBytes < (8u << 20))
+        {
+            std::fwrite(p, 1, n, mH265Dump);
+            std::fflush(mH265Dump);
+            mH265DumpBytes += n;
+        }
+    }
+
+    int mVideoFrameCount    = 0;
+    std::FILE * mH265Dump   = nullptr;
+    size_t mH265DumpBytes   = 0;
+
     // Lazy-init state
     bool mAudioInitDone = false;
     bool mVideoInitDone = false;
@@ -464,19 +611,26 @@ public:
                 }
                 if (map->format == codec)
                 {
-                    ChipLogProgress(Camera, "%s codec has payload type: %d", codec.c_str(), pt);
+                    ChipLogProgress(Camera, "WEBRTC_CODEC: codec %s matched an OFFERED payload type: %d", codec.c_str(),
+                                    pt);
                     return pt;
                 }
             }
         }
-        ChipLogError(Camera, "Payload type for codec %s not found", codec.c_str());
+        ChipLogError(Camera,
+                     "WEBRTC_CODEC: payload type for codec %s NOT present in the peer's SDP — the controller did "
+                     "not offer this codec. Falling back to a HARDCODED default PT; the answer will advertise a "
+                     "payload type the peer never proposed and the stream may be undecodable.",
+                     codec.c_str());
         // Return default values for the supported codec
         if (codec == "H264")
         {
+            ChipLogError(Camera, "WEBRTC_CODEC: using FALLBACK H264 pt=%d (not from offer)", kVideoH264PayloadType);
             return kVideoH264PayloadType;
         }
         else if (codec == "H265")
         {
+            ChipLogError(Camera, "WEBRTC_CODEC: using FALLBACK H265 pt=%d (not from offer)", kVideoH265PayloadType);
             return kVideoH265PayloadType;
         }
         else if (codec == "opus")
@@ -509,7 +663,13 @@ public:
             // SDP codec descriptor and RTP packetizer differ.
             if (codec == "H265")
             {
-                vMedia.addH265Codec(payloadType);
+                // Unlike addH264Codec (whose default emits a full fmtp), addH265Codec's default
+                // profile is nullopt = NO a=fmtp line at all. SmartThings' Android player matches
+                // decoder configs strictly on these params ("Trying to create decoder for
+                // unsupported format" with a bare H265), so state the RFC 7798 defaults explicitly
+                // — same string a working Samsung S1 camera answers with: Main profile (1), Main
+                // tier (0), level 3.1 (93), single-stream mode.
+                vMedia.addH265Codec(payloadType, "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST");
             }
             else
             {
