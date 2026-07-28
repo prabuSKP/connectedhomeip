@@ -510,6 +510,22 @@ CHIP_ERROR WebRTCProviderManager::HandleProvideOffer(const ProvideOfferRequestAr
     auto peerConnection  = transport->GetPeerConnection();
     std::string audioMid = ExtractMidFromSdp(args.sdp, "audio");
     std::string videoMid = ExtractMidFromSdp(args.sdp, "video");
+
+    // DIAGNOSTIC (grep "WEBRTC_CODEC"): dump every codec the controller OFFERED, so one live-view
+    // attempt on the hub shows exactly which video payload types SmartThings proposed. If the codec
+    // we choose below is NOT in this list, GetPayloadType falls back to a hardcoded PT the controller
+    // never offered and the answer becomes undecodable by the peer — this is the single most
+    // important fact for "are we sending SmartThings the right SDP answer?".
+    for (size_t p = args.sdp.find("a=rtpmap:"); p != std::string::npos; p = args.sdp.find("a=rtpmap:", p))
+    {
+        size_t eol       = args.sdp.find('\n', p);
+        std::string line = args.sdp.substr(p, (eol == std::string::npos ? args.sdp.size() : eol) - p);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        ChipLogProgress(Camera, "WEBRTC_CODEC: controller offered %s", line.c_str());
+        p = (eol == std::string::npos) ? args.sdp.size() : eol + 1;
+    }
+
     // The camera's real stream codec ("H264" or "H265") — SmartThings offers both payload types
     // in the SDP, so we must look up the one matching what this camera actually sends, not
     // always H264.
@@ -520,6 +536,13 @@ CHIP_ERROR WebRTCProviderManager::HandleProvideOffer(const ProvideOfferRequestAr
     ChipLogProgress(Camera, "Extracted audioMid: %s, payloadType: %d", audioMid.c_str(), audioPt);
     ChipLogProgress(Camera, "Extracted videoMid: %s, payloadType: %d, codec: %s", videoMid.c_str(), videoPt,
                      videoCodec.c_str());
+    // WEBRTC_CODEC summary line: the camera's real codec is the source of truth. Cross-check this
+    // codec+PT against the "controller offered" lines above and the "Local Description (answer)"
+    // dump below — all three must agree for SmartThings to decode the stream.
+    ChipLogProgress(Camera,
+                    "WEBRTC_CODEC: camera-real-codec=%s -> answering video with codec=%s pt=%d (session=%u)",
+                    (mCameraDevice != nullptr) ? mCameraDevice->GetVideoCodec().c_str() : "none(no-camera-device)",
+                    videoCodec.c_str(), videoPt, args.sessionId);
 
     transport->AddVideoTrack(videoMid, videoPt, videoCodec);
     if (!audioStreams.empty())
