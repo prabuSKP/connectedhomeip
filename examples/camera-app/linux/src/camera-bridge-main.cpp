@@ -70,6 +70,7 @@
 #include <cctype>
 #include <chrono> // discover debounce: steady_clock timestamp of the last completed scan
 #include <fstream>
+#include <functional> // codec-correction handler installed on each CameraDevice
 #include <memory>
 #include <sstream> // MacFromArp: parse /proc/net/arp
 #include <string>
@@ -194,6 +195,17 @@ public:
     void SetEntry(const CameraConfig::CameraEntry & e) { mEntry = e; }
     const CameraConfig::CameraEntry & GetEntry() const { return mEntry; }
     const std::string & GetDni() const { return mEntry.dni; }
+
+    // Live video codec as the media pipeline currently sees it. This can differ from
+    // mEntry.onvif.videoCodec: the CameraDevice self-heals a wrong persisted codec from the
+    // real RTSP pad caps (see camera-device.h). Thread-safe read.
+    std::string GetLiveVideoCodec() { return mCameraDevice.GetVideoCodec(); }
+
+    // Let the device write a self-healing codec correction back to cameras.json.
+    void SetCodecCorrectionHandler(std::function<void(const std::string &)> handler)
+    {
+        mCameraDevice.SetCodecCorrectionHandler(std::move(handler));
+    }
 
     // DataVersion backing store for the ember cluster list above (Descriptor only = 1 entry).
     DataVersion mDataVersions[MATTER_ARRAY_SIZE(sBridgedCameraClusters)] = {};
@@ -499,6 +511,18 @@ int AddCamera(const CameraConfig::CameraEntry & entry)
     auto cam = std::make_unique<BridgedCamera>(entry.name.c_str(), entry.onvif);
     cam->SetEntry(entry);
 
+    // Self-healing codec correction: if the persisted codec turns out to disagree with the
+    // camera's real RTSP stream, the device fixes itself and calls this to make the fix stick
+    // across reboots. It runs on that camera's watchdog thread, so it deliberately does NOT
+    // touch gBridgedCameras (single-mutator: the IPC thread) — it patches the one entry in
+    // cameras.json directly, serialised inside cameras-config. The in-memory mEntry converges
+    // separately: PersistCameras() reads the live codec back out of the device.
+    if (!entry.dni.empty())
+    {
+        cam->SetCodecCorrectionHandler(
+            [dni = entry.dni](const std::string & codec) { CameraConfig::PatchVideoCodec(dni, codec); });
+    }
+
     // Stable identity: derive the Bridged uniqueId from the DNI so a camera keeps
     // its identity across restarts. The id is capped (Device::kDeviceUniqueIdSize,
     // 32); keep the tail — the UUID part of "onvif-urn:uuid:<uuid>" — which is the
@@ -613,8 +637,15 @@ int KnownBasicAuth(const std::string & sid)
 std::string KnownVideoCodec(const std::string & sid)
 {
     for (const auto & cam : gBridgedCameras)
+    {
         if (StableCameraId(cam->GetEntry().dni) == sid)
-            return cam->GetEntry().onvif.videoCodec;
+        {
+            // Prefer the LIVE codec: the device may have self-healed a wrong persisted value
+            // from the real RTSP pad caps, and a re-resolve must not undo that correction.
+            const std::string live = cam->GetLiveVideoCodec();
+            return live.empty() ? cam->GetEntry().onvif.videoCodec : live;
+        }
+    }
     return {};
 }
 
@@ -647,7 +678,15 @@ void PersistCameras()
     std::vector<CameraConfig::CameraEntry> entries;
     entries.reserve(gBridgedCameras.size());
     for (const auto & cam : gBridgedCameras)
+    {
         entries.push_back(cam->GetEntry());
+        // The device is the authority on the codec: it may have self-healed a wrong persisted
+        // value from the live RTSP pad caps. Without this, any later save (an unrelated
+        // upsert/remove/discover) would write the stale entry back over the correction.
+        const std::string liveCodec = cam->GetLiveVideoCodec();
+        if (!liveCodec.empty())
+            entries.back().onvif.videoCodec = liveCodec;
+    }
     CameraConfig::SaveToFile(entries);
 }
 

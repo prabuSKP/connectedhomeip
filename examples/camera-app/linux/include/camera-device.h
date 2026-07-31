@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <gst/gst.h>
 #include <map>
 #include <mutex>
@@ -383,8 +384,47 @@ public:
     const OnvifConfig & GetOnvifConfig() const { return mOnvifConfig; }
 
     // CameraDeviceInterface: real RTSP-source codec ("H264" | "H265"), used by the WebRTC layer
-    // to select the matching depayloader/packetizer instead of assuming H264.
-    std::string GetVideoCodec() override { return mOnvifConfig.videoCodec; }
+    // to select the matching depayloader/packetizer instead of assuming H264. Locked: the
+    // self-healing correction below rewrites this from the watchdog thread while the WebRTC
+    // thread reads it here (see mCodecMutex).
+    std::string GetVideoCodec() override
+    {
+        std::lock_guard<std::mutex> lk(mCodecMutex);
+        return mOnvifConfig.videoCodec;
+    }
+
+    // ---- Self-healing video-codec correction ---------------------------------------------
+    // The persisted videoCodec comes from the RTSP SDP probe at onboarding, falling back to
+    // the camera's ONVIF GetProfiles metadata when that probe fails (2 s timeout, no retry).
+    // Some cameras report a codec in ONVIF that does not match what their RTSP stream
+    // actually carries, and once a wrong value is persisted it is sticky: the pipeline is
+    // built with the wrong depayloader, rtspsrc's video pad cannot be linked, and live view
+    // stays dead until somebody re-onboards the camera by hand.
+    //
+    // rtspsrc's pad caps carry the stream's TRUE encoding, so the pad-added callback reports
+    // it here and the watchdog — which already owns pipeline teardown/rebuild — applies the
+    // correction and rebuilds with the right depayloader. Bounded (kMaxCodecCorrections) so a
+    // camera that genuinely alternates codecs cannot drive a rebuild loop.
+    //
+    // SCOPE: this repairs the GStreamer pipeline, not the WebRTC session that triggered it.
+    // The SDP answer is built (with the then-current codec) BEFORE the pipeline starts, so the
+    // live-view attempt that detects the mismatch still shows nothing — its track was already
+    // negotiated for the wrong codec. The NEXT attempt negotiates correctly, and after the
+    // write-back below every attempt from the next boot onward is right the first time. The
+    // point is that the camera stops being permanently broken, not that attempt #1 recovers.
+    //
+    // Called from the GStreamer streaming thread (pad-added); does no teardown itself.
+    void NoteStreamEncoding(const char * encodingName);
+
+    // Installed by the bridge main so a correction is written back to cameras.json and
+    // survives a reboot. Invoked from the watchdog thread with NO CameraDevice lock held;
+    // must not call back into this CameraDevice. Optional — without it the camera still
+    // self-heals, just once per boot.
+    void SetCodecCorrectionHandler(std::function<void(const std::string &)> handler)
+    {
+        std::lock_guard<std::mutex> lk(mCodecMutex);
+        mCodecFixHandler = std::move(handler);
+    }
 
     void HandleSimulatedZoneTriggeredEvent(const std::vector<uint16_t> & zoneIds);
 
@@ -515,6 +555,22 @@ private:
     // thread). Lock order: mPipelineLifecycleMutex -> mWatchdogMutex (never the reverse).
     std::mutex mWatchdogMutex;
     std::map<uint16_t, WatchdogStreamState> mWatchdogStreams;
+
+    // Guards mOnvifConfig.videoCodec (written by the watchdog thread, read by the WebRTC
+    // thread via GetVideoCodec and by the pipeline builder) and the correction bookkeeping
+    // below. Deliberately its OWN mutex, not mWatchdogMutex: nothing else is ever locked
+    // while this is held, so it cannot participate in a lock cycle. Order when nested:
+    // mPipelineLifecycleMutex -> mCodecMutex.
+    std::mutex mCodecMutex;
+    std::string mPendingCodecFix;                 // "H264"/"H265" queued by NoteStreamEncoding
+    int mCodecFixCount                            = 0;
+    static constexpr int kMaxCodecCorrections     = 3;
+    std::function<void(const std::string &)> mCodecFixHandler; // persist hook (may be null)
+
+    // Consume a queued correction: applies it to mOnvifConfig.videoCodec and returns the new
+    // codec, or "" when there is nothing to do. Must be called with mPipelineLifecycleMutex
+    // held (the caller rebuilds the pipeline off the back of it).
+    std::string TakePendingCodecFix();
 
     std::thread mWatchdogThread;
     std::mutex mWatchdogCvMutex;

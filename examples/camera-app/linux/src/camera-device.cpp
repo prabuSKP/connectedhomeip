@@ -667,9 +667,13 @@ static void OnvifLinkRtspPadAV(GstElement * src, GstPad * newPad, gpointer user_
                 {
                     ChipLogError(Camera,
                                  "ONVIF: could not link video pad — stream encoding=%s does not match the "
-                                 "configured depayloader. The camera's real codec differs from what was detected; "
-                                 "re-onboard the camera to re-probe, or set its encoding to H.264/H.265.",
+                                 "configured depayloader. The camera's real codec differs from what was detected.",
                                  encoding ? encoding : "unknown");
+                    // Self-heal: the pad caps are ground truth for this session, so hand the real
+                    // encoding to the watchdog, which rebuilds with the matching depayloader. No
+                    // teardown from here — this is the streaming thread inside a pad-added
+                    // callback, and tearing the pipeline down under it would deadlock.
+                    ctx->device->NoteStreamEncoding(encoding);
                 }
             }
             if (sinkPad)
@@ -720,7 +724,8 @@ GstElement * CameraDevice::CreateVideoPipeline(const std::string & device, int w
         // H.265 is the SAME zero-transcode passthrough as H.264 — only the RTP depayloader and the
         // parser differ (rtph265depay/h265parse vs rtph264depay/h264parse); the compressed access
         // units flow straight to the appsink untouched.
-        const bool   isH265        = (mOnvifConfig.videoCodec == "H265");
+        // Read under mCodecMutex: the watchdog's self-healing correction rewrites this field.
+        const bool   isH265        = (GetVideoCodec() == "H265");
         GstElement * pipeline      = gst_pipeline_new("video-pipeline");
         GstElement * source        = gst_element_factory_make("rtspsrc", "source");
         GstElement * depay         = gst_element_factory_make(isH265 ? "rtph265depay" : "rtph264depay", "depay");
@@ -2015,6 +2020,98 @@ void CameraDevice::SetAudioBranchLinked(bool linked)
     mAudioBranchLinked = linked;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Self-healing video-codec correction. See the block comment in camera-device.h.
+// ---------------------------------------------------------------------------------------------
+
+// GStreamer streaming thread (rtspsrc pad-added). Records the stream's real encoding when it
+// contradicts what the pipeline was built with; the watchdog applies it. Deliberately does
+// nothing else: no teardown, no persistence, no logging under a lock held by anyone else.
+void CameraDevice::NoteStreamEncoding(const char * encodingName)
+{
+    if (encodingName == nullptr)
+    {
+        return;
+    }
+
+    // Only codecs this bridge can actually build a passthrough pipeline for. Anything else
+    // (MP4V-ES, JPEG, a vendor blob) is left alone: "correcting" to a codec with no
+    // depayloader would swap one dead pipeline for another and burn a correction budget.
+    std::string detected;
+    if (g_ascii_strcasecmp(encodingName, "H264") == 0)
+    {
+        detected = "H264";
+    }
+    else if (g_ascii_strcasecmp(encodingName, "H265") == 0)
+    {
+        detected = "H265";
+    }
+    else
+    {
+        ChipLogError(Camera, "CAM_CODEC: stream encoding=%s is not a supported passthrough codec (H264/H265) — cannot self-heal",
+                     encodingName);
+        return;
+    }
+
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lk(mCodecMutex);
+        // Already correct, or already queued: nothing to do. This is what makes the correction
+        // one-shot — once applied, mOnvifConfig.videoCodec == detected, so the same pad-added
+        // report can never re-arm it.
+        if (mOnvifConfig.videoCodec != detected && mPendingCodecFix != detected)
+        {
+            mPendingCodecFix = detected;
+            queued           = true;
+        }
+    }
+
+    if (queued)
+    {
+        ChipLogProgress(Camera, "CAM_CODEC: real stream encoding is %s — queueing self-healing pipeline rebuild", detected.c_str());
+        // Wake the watchdog now instead of waiting out the kWatchdogNoDataSec no-data window:
+        // an unlinked video pad delivers no buffers, so the fix is knowable immediately.
+        StartWatchdog();
+    }
+}
+
+// Watchdog thread, with mPipelineLifecycleMutex held. Returns the corrected codec, or "".
+std::string CameraDevice::TakePendingCodecFix()
+{
+    std::lock_guard<std::mutex> lk(mCodecMutex);
+    if (mPendingCodecFix.empty())
+    {
+        return {};
+    }
+
+    const std::string fix = mPendingCodecFix;
+    mPendingCodecFix.clear();
+
+    if (fix == mOnvifConfig.videoCodec)
+    {
+        return {}; // raced with an earlier apply; already correct
+    }
+
+    // Bounded. A correct camera converges in ONE correction; hitting the cap means the stream's
+    // codec is genuinely alternating (dual-profile camera, changed config), and continuing to
+    // chase it would rebuild the pipeline forever. Stop and say so loudly — the operator has to
+    // pin the camera's encoding or re-onboard it.
+    if (mCodecFixCount >= kMaxCodecCorrections)
+    {
+        ChipLogError(Camera,
+                     "CAM_CODEC: stream encoding flipped to %s again after %d corrections — giving up to avoid a rebuild "
+                     "loop. Pin the camera's encoding (H.264 or H.265) and re-onboard it.",
+                     fix.c_str(), mCodecFixCount);
+        return {};
+    }
+
+    ChipLogProgress(Camera, "CAM_CODEC: correcting video codec %s -> %s (detected from the live RTSP stream)",
+                    mOnvifConfig.videoCodec.c_str(), fix.c_str());
+    mOnvifConfig.videoCodec = fix;
+    mCodecFixCount++;
+    return fix;
+}
+
 void CameraDevice::StartWatchdog()
 {
     {
@@ -2090,6 +2187,28 @@ bool CameraDevice::WatchdogCheckStreams()
     const auto now    = std::chrono::steady_clock::now();
     bool anyConsumers = false;
 
+    // Self-healing codec correction (see camera-device.h). Consumed once per tick for the WHOLE
+    // device: mOnvifConfig is per-camera, so one correction applies to every stream it owns.
+    // Empty (the steady state) means this whole block costs one uncontended mutex acquire.
+    const std::string codecFix = TakePendingCodecFix();
+    if (!codecFix.empty())
+    {
+        // Write the correction back to cameras.json so the next boot starts with the right
+        // depayloader instead of re-learning it. Copy the handler out first: it must run with
+        // no CameraDevice lock held, and it must not re-enter this device (it does file I/O
+        // only) — the removal path joins this thread, so blocking here on a lock the IPC
+        // thread could hold would deadlock.
+        std::function<void(const std::string &)> persist;
+        {
+            std::lock_guard<std::mutex> lk(mCodecMutex);
+            persist = mCodecFixHandler;
+        }
+        if (persist)
+        {
+            persist(codecFix);
+        }
+    }
+
     for (auto & stream : mVideoStreams)
     {
         const uint16_t streamID = stream.videoStreamParams.videoStreamID;
@@ -2118,17 +2237,32 @@ bool CameraDevice::WatchdogCheckStreams()
                 seed.lastData          = now;
                 seed.pipelineStart     = now;
                 mWatchdogStreams[streamID] = seed;
-                continue; // just seeded; evaluate on the next tick
+                if (codecFix.empty())
+                {
+                    continue; // just seeded; evaluate on the next tick
+                }
+                // A codec correction was consumed this tick — it is one-shot, so deferring this
+                // stream to the next tick would drop its rebuild entirely. Fall through on the
+                // freshly-seeded state (backoff 0, nextRestart at epoch), which permits it.
+                lastData    = seed.lastData;
+                nextRestart = seed.nextRestart;
+                backoffSec  = seed.backoffSec;
             }
-            lastData    = wit->second.lastData;
-            nextRestart = wit->second.nextRestart;
-            backoffSec  = wit->second.backoffSec;
+            else
+            {
+                lastData    = wit->second.lastData;
+                nextRestart = wit->second.nextRestart;
+                backoffSec  = wit->second.backoffSec;
+            }
         }
 
         // Bounded retry: while inside the backoff window, do nothing AND leave any bus
         // ERROR/EOS queued (F5) so it is acted on the moment the backoff expires rather than
-        // being consumed and lost.
-        if (now < nextRestart)
+        // being consumed and lost. A codec correction jumps the queue: the old pipeline is
+        // provably unable to link its video pad, so waiting out the backoff only delays a
+        // rebuild that is guaranteed to be needed. Safe from looping because the correction is
+        // one-shot per distinct codec and capped by kMaxCodecCorrections.
+        if (codecFix.empty() && now < nextRestart)
         {
             continue;
         }
@@ -2186,7 +2320,7 @@ bool CameraDevice::WatchdogCheckStreams()
             }
         }
 
-        if (!(busFailure || noData || pipelineMissing))
+        if (!(busFailure || noData || pipelineMissing || !codecFix.empty()))
         {
             continue;
         }
@@ -2200,7 +2334,12 @@ bool CameraDevice::WatchdogCheckStreams()
             newBackoff = kWatchdogMaxBackoffSec;
         }
 
-        if (busFailure)
+        if (!codecFix.empty())
+        {
+            ChipLogProgress(Camera, "RTSP watchdog: rebuilding video stream %u with the corrected %s depayloader", streamID,
+                            codecFix.c_str());
+        }
+        else if (busFailure)
         {
             ChipLogError(Camera, "RTSP watchdog: bus ERROR/EOS on video stream %u — restarting pipeline (retry backoff %ds)",
                          streamID, newBackoff);

@@ -71,4 +71,15 @@ std::vector<CameraEntry> LoadFromFile(const char * path = kDefaultPath);
 // this writer, do not escape) — fine for URLs/tokens/usernames.
 bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path = kDefaultPath);
 
+// Rewrite ONE camera's video_codec in place: load `path`, update the entry whose dni matches,
+// save. Returns true if a matching entry was found and the file was written.
+//
+// Exists for the self-healing codec correction (see camera-device.h), which runs on a
+// CameraDevice's watchdog thread and therefore must NOT touch the bridge's gBridgedCameras
+// vector — that is single-mutator (IPC thread) by design. This does file I/O only, and is
+// serialised against SaveToFile by an internal mutex so a concurrent full save cannot
+// interleave with this read-modify-write. It takes no other lock and is never held across a
+// thread join, so it cannot deadlock the camera-removal path.
+bool PatchVideoCodec(const std::string & dni, const std::string & videoCodec, const char * path = kDefaultPath);
+
 } // namespace CameraConfig

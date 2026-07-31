@@ -21,11 +21,17 @@
 #include <cstdint>
 #include <fstream>
 #include <lib/support/logging/CHIPLogging.h>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace CameraConfig {
+
+// Guards writes to the config file (see SaveToFile). Held only for the duration of the file
+// I/O and never while taking another lock or joining a thread, so it cannot deadlock.
+static std::mutex gFileMutex;
+static bool SaveToFileLocked(const std::vector<CameraEntry> & cameras, const char * path);
 
 namespace {
 
@@ -317,6 +323,16 @@ std::vector<CameraEntry> LoadFromFile(const char * path)
 
 bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
 {
+    // Serialise every writer of this file. The bridge's own saves all come from the single IPC
+    // thread, but the self-healing codec correction (PatchVideoCodec) writes from a camera's
+    // watchdog thread, and its read-modify-write must not interleave with a full save.
+    std::lock_guard<std::mutex> lk(gFileMutex);
+    return SaveToFileLocked(cameras, path);
+}
+
+// Caller holds gFileMutex.
+static bool SaveToFileLocked(const std::vector<CameraEntry> & cameras, const char * path)
+{
     // Write to a sibling .tmp then rename, so a crash mid-write can't truncate
     // the live config (rename is atomic on the same filesystem).
     std::string tmpPath = std::string(path) + ".tmp";
@@ -391,6 +407,45 @@ bool SaveToFile(const std::vector<CameraEntry> & cameras, const char * path)
 
     ChipLogProgress(Camera, "cameras-config: saved %zu camera(s) to %s", cameras.size(), path);
     return true;
+}
+
+bool PatchVideoCodec(const std::string & dni, const std::string & videoCodec, const char * path)
+{
+    if (dni.empty() || videoCodec.empty())
+    {
+        return false;
+    }
+
+    // Load + save under one lock so a full SaveToFile cannot land between them and lose either
+    // this correction or the cameras that save was adding.
+    std::lock_guard<std::mutex> lk(gFileMutex);
+
+    std::vector<CameraEntry> entries = LoadFromFile(path);
+    bool found                       = false;
+    for (auto & e : entries)
+    {
+        if (e.dni == dni)
+        {
+            if (e.onvif.videoCodec == videoCodec)
+            {
+                return true; // already right on disk (e.g. a save raced us) — nothing to write
+            }
+            e.onvif.videoCodec = videoCodec;
+            found              = true;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        // The camera was removed, or was never persisted (CLI single-camera fallback). The
+        // in-memory correction still stands; there is just nothing on disk to update.
+        ChipLogProgress(Camera, "cameras-config: no entry for dni=%s — video_codec correction not persisted", dni.c_str());
+        return false;
+    }
+
+    ChipLogProgress(Camera, "cameras-config: persisted corrected video_codec=%s for dni=%s", videoCodec.c_str(), dni.c_str());
+    return SaveToFileLocked(entries, path);
 }
 
 } // namespace CameraConfig
