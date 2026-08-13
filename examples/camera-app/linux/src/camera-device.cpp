@@ -1278,18 +1278,23 @@ bool EncodeFrameToJpeg(AVFrame * frame, const std::string & path)
     return ok;
 }
 
-// Fallback snapshot: pull one H.264 keyframe from RTSP with a short-lived GStreamer pipeline
-// (independent of the live-view path), decode it with libav, and MJPEG-encode to `path`.
-// The hub ships no jpegenc/decoder GStreamer plugins, so decode+encode is done via libav.
+// Fallback snapshot: pull one keyframe (H.264 or H.265) from RTSP with a short-lived
+// GStreamer pipeline (independent of the live-view path), decode it with libav, and
+// MJPEG-encode to `path`. The hub ships no jpegenc/decoder GStreamer plugins, so
+// decode+encode is done via libav.
 bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & user, const std::string & pass,
-                     const std::string & path, int timeoutSec)
+                     const std::string & path, int timeoutSec, bool isH265)
 {
     if (rtspUrl.empty())
         return false;
 
-    std::string desc = "rtspsrc name=src location=\"" + rtspUrl +
-        "\" protocols=tcp latency=100 ! rtph264depay ! h264parse config-interval=-1 ! "
-        "video/x-h264,stream-format=byte-stream,alignment=au ! "
+    // Mirrors the live-view codec branch (~line 728): the depay/parse elements and caps mime
+    // type must match the camera's real RTSP codec, not just assume H.264, or the pipeline
+    // never links for an H.265 camera and this tier silently fails.
+    std::string desc = "rtspsrc name=src location=\"" + rtspUrl + "\" protocols=tcp latency=100 ! " +
+        (isH265 ? "rtph265depay" : "rtph264depay") + " ! " + (isH265 ? "h265parse" : "h264parse") +
+        " config-interval=-1 ! " + (isH265 ? "video/x-h265" : "video/x-h264") +
+        ",stream-format=byte-stream,alignment=au ! "
         "appsink name=sink emit-signals=false sync=false max-buffers=60 drop=true";
     GError * gerr         = nullptr;
     GstElement * pipeline = gst_parse_launch(desc.c_str(), &gerr);
@@ -1322,7 +1327,9 @@ bool SnapshotViaRtsp(const std::string & rtspUrl, const std::string & user, cons
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
-    const AVCodec * dec   = avcodec_find_decoder(AV_CODEC_ID_H264);
+    // Mirrors the live-view codec branch (~line 728): decode with the codec the camera
+    // actually streams, not a hardcoded H.264 assumption.
+    const AVCodec * dec   = avcodec_find_decoder(isH265 ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
     AVCodecContext * dctx = dec ? avcodec_alloc_context3(dec) : nullptr;
     AVFrame * frame       = av_frame_alloc();
     AVPacket * pkt        = av_packet_alloc();
@@ -1398,12 +1405,15 @@ constexpr int kMaxConcurrentPrefetch = 2;
 
 // Hybrid on-demand snapshot: ONVIF snapshot URI first (camera-produced JPEG, no local
 // decode), else decode one RTSP keyframe. Writes a JPEG to `path`.
-// Decode a single H.264 access unit (Annex-B with SPS/PPS inline) to a JPEG file via libav.
-bool DecodeAuToJpeg(const uint8_t * au, size_t auSize, const std::string & path)
+// Decode a single access unit (H.264 or H.265, Annex-B with parameter sets inline) to a JPEG
+// file via libav.
+bool DecodeAuToJpeg(const uint8_t * au, size_t auSize, const std::string & path, bool isH265)
 {
     if (au == nullptr || auSize == 0)
         return false;
-    const AVCodec * dec   = avcodec_find_decoder(AV_CODEC_ID_H264);
+    // Mirrors the live-view codec branch (~line 728): the cached access unit is whatever the
+    // camera's real RTSP codec is, so the decoder must match instead of assuming H.264.
+    const AVCodec * dec   = avcodec_find_decoder(isH265 ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
     AVCodecContext * dctx = dec ? avcodec_alloc_context3(dec) : nullptr;
     AVFrame * frame       = av_frame_alloc();
     AVPacket * pkt        = av_packet_alloc();
@@ -1511,6 +1521,9 @@ bool ReencodeJpegToFit(const std::string & jpeg, const std::string & path)
 bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & cachedKeyframe, bool liveActive,
                           bool cacheFresh, const std::string & path, bool onvifOnly = false)
 {
+    // Same codec test as the live-view pipeline branch (~line 728): the cached keyframe and any
+    // dedicated RTSP grab below carry the camera's real (possibly H.265) codec, not H.264.
+    const bool isH265 = (cfg.videoCodec == "H265");
     std::string jpeg;
     if (FetchOnvifSnapshot(cfg.snapshotUrl, cfg.user, cfg.pass, jpeg))
     {
@@ -1554,20 +1567,21 @@ bool GenerateSnapshotJpeg(const OnvifConfig & cfg, const std::vector<uint8_t> & 
     }
     // While streaming (or if a viewer just did), the cached live keyframe is current — decode it and
     // never open a competing RTSP session.
-    if ((liveActive || cacheFresh) && !cachedKeyframe.empty() && DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path))
+    if ((liveActive || cacheFresh) && !cachedKeyframe.empty() &&
+        DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path, isH265))
     {
         ChipLogProgress(Camera, "Snapshot: decoded cached live keyframe -> %s", path.c_str());
         return true;
     }
     // Idle + stale (nobody streaming, cache old/empty): grab a FRESH frame with a short dedicated RTSP
     // session. Safe from contention because nothing else is using the camera right now.
-    if (!liveActive && SnapshotViaRtsp(cfg.rtspUrl, cfg.user, cfg.pass, path, /*timeoutSec=*/3))
+    if (!liveActive && SnapshotViaRtsp(cfg.rtspUrl, cfg.user, cfg.pass, path, /*timeoutSec=*/3, isH265))
     {
         ChipLogProgress(Camera, "Snapshot: refreshed via dedicated RTSP keyframe -> %s", path.c_str());
         return true;
     }
     // Last resort: a stale cached frame beats no thumbnail (e.g. a viewer is mid-negotiation).
-    if (!cachedKeyframe.empty() && DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path))
+    if (!cachedKeyframe.empty() && DecodeAuToJpeg(cachedKeyframe.data(), cachedKeyframe.size(), path, isH265))
     {
         ChipLogProgress(Camera, "Snapshot: decoded stale cached keyframe (fallback) -> %s", path.c_str());
         return true;
@@ -1626,6 +1640,13 @@ void CameraDevice::TriggerSnapshotRefresh(bool onvifOnly)
     }
 
     OnvifConfig cfgCopy = mOnvifConfig;
+    // mOnvifConfig.videoCodec is guarded by mCodecMutex (the self-healing watchdog rewrites it
+    // concurrently from a different thread, see NoteStreamEncoding/TakePendingCodecFix) -- the
+    // struct-copy above is unguarded, so re-read videoCodec through the locked accessor instead
+    // of trusting whatever the racy copy picked up. Now that GenerateSnapshotJpeg() actually
+    // branches on this field (H264 vs H265 depay/decoder), a stale read here silently fails
+    // the snapshot for the camera that's mid-correction.
+    cfgCopy.videoCodec = GetVideoCodec();
     std::vector<uint8_t> keyframeCopy;
     bool cacheFresh = false;
     {
