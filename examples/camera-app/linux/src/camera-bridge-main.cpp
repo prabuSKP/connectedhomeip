@@ -35,6 +35,10 @@
 // Falls back to a single camera from CLI --camera-onvif-url etc. if the file
 // is absent (single-camera bring-up / backward-compat).
 
+#ifdef HAVE_TUYA
+#include "tuya/tuya_runtime.h"
+#endif
+
 #include "CameraAppCommandDelegate.h"
 #include "bridge-ipc-server.h"
 #include "camera-app.h"
@@ -1641,10 +1645,21 @@ void ApplicationInit()
     {
         ChipLogError(Camera, "CameraBridge: IPC server failed to start on :9444 (runtime add/remove disabled)");
     }
+#ifdef HAVE_TUYA
+    // Start local IPC immediately; cloud work never blocks camera initialization.
+    const char * host = getenv("TUYA_IPC_HOST");
+    const char * dir = getenv("TUYA_DATA_DIR");
+    if (!tuya_runtime_start(host ? host : "0.0.0.0", dir ? dir : "/data/tuya-bridge"))
+        ChipLogError(Camera, "Tuya runtime failed to start (check IPC token and configuration)");
+#endif
+
 }
 
 void ApplicationShutdown()
 {
+#ifdef HAVE_TUYA
+    tuya_runtime_stop();
+#endif
     // Stop accepting IPC requests first and join the accept thread, so no upsert/
     // remove can mutate the camera list while we tear it down below.
     BridgeIpc::Stop();

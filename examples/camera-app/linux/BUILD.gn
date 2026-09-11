@@ -22,6 +22,7 @@ import("${build_root}/config/linux/pkg_config.gni")
 assert(chip_build_tools)
 
 declare_args() {
+  tuya_cloud_enabled = false
   # Absolute path to the onvif-camera-bridge daemon dir (supplies libonvif.a + headers).
   # Injected by matter-bridge/build.sh (github.com/prabuSKP/Matter-Bridge) so this file
   # stays machine independent.
@@ -178,6 +179,21 @@ executable("chip-camera-bridge-app") {
   ]
 
   libs = [ "curl", "onvif" ]
+  if (tuya_cloud_enabled) {
+    defines = [ "HAVE_TUYA" ]
+    # Use a file path so Ninja tracks archive changes and relinks after C fixes.
+    if (target_cpu == "arm") {
+      libs += [ "$onvif_bridge_daemon_dir/arm/libtuya.a" ]
+    } else {
+      libs += [ "$onvif_bridge_daemon_dir/libtuya.a" ]
+    }
+    libs += [
+      "ssl",
+      "crypto",
+      "pthread",
+    ]
+  }
+
   if (target_cpu == "arm") {
     lib_dirs = [ "$onvif_bridge_daemon_dir/arm" ]
   } else {
