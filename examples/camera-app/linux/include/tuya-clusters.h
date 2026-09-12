@@ -230,7 +230,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// FanControl (0x002B) — MultiSpeed + Step.
+// FanControl (cluster 0x0202; the ma_fan DEVICE TYPE is 0x002B, used in
+// kFanDeviceTypes in tuya-bridge-endpoints.cpp — not this cluster) — MultiSpeed + Step.
 // ---------------------------------------------------------------------------
 class FanControlDelegate
 {

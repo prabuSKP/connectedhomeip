@@ -77,6 +77,7 @@
 #include <fstream>
 #include <functional> // codec-correction handler installed on each CameraDevice
 #include <memory>
+#include <mutex>
 #include <sstream> // MacFromArp: parse /proc/net/arp
 #include <string>
 #include <unistd.h> // _exit
@@ -150,6 +151,22 @@ EndpointId gFirstDynamicEndpointId;
 
 // Slot array mirrors bridge-app pattern; index → slot in the dynamic endpoint table.
 Device * gDevices[CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT];
+
+// Guards the ENTIRE claim-a-slot / emberAfSetDynamicEndpoint / erase-a-slot sequence for
+// gDevices[], gCurrentEndpointId and gFirstDynamicEndpointId, across BOTH device families
+// that mutate them: cameras (AddCameraEndpoint/RemoveCameraByDni, driven by the ONVIF IPC
+// accept thread) and Tuya devices (TuyaBridge::Add/RemoveBridgedDeviceEndpoint, driven by
+// the Tuya worker/Pulsar/IPC threads). Before Tuya, exactly one foreign thread ever touched
+// this table, so no lock was needed (see the historical comment on gBridgedCameras below);
+// adding a second, independent thread family reintroduced a real data race on the plain
+// "if (gDevices[index] != nullptr) ... gDevices[index] = dev;" claim step, which runs
+// BEFORE StackLock is taken, plus a scan-vs-write race against the removal paths. Always
+// acquire this BEFORE StackLock, never the reverse (StackLock is taken deep inside the
+// critical section below, not the other way around) -- consistent order, no deadlock.
+// None of the four critical sections block on I/O (ONVIF resolve / RTSP probe / cloud
+// calls all happen in the caller, before these functions run), so holding this for a whole
+// function body is cheap.
+std::mutex gDeviceTableMutex;
 
 // ---------------------------------------------------------------------------
 // BridgedCamera: one ONVIF/WebRTC backend bound to one dynamic endpoint.
@@ -442,6 +459,8 @@ int TryDirectRtsp(const std::string & ip, const std::string & name, const std::s
 // ---------------------------------------------------------------------------
 int AddCameraEndpoint(BridgedCamera * cam, EndpointId parentId)
 {
+    // Shared with Tuya's AddBridgedDeviceEndpoint: see gDeviceTableMutex's comment.
+    std::lock_guard<std::mutex> tableLock(gDeviceTableMutex);
     // Slot 0 is reserved for the Aggregator endpoint; cameras occupy slots 1+.
     for (uint8_t index = 1; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++index)
     {
@@ -581,6 +600,8 @@ bool RemoveCameraByDni(const std::string & dni, bool purgePersistedTransports)
     if (dni.empty())
         return false;
 
+    // Shared with Tuya's RemoveBridgedDeviceEndpoint: see gDeviceTableMutex's comment.
+    std::lock_guard<std::mutex> tableLock(gDeviceTableMutex);
     for (auto it = gBridgedCameras.begin(); it != gBridgedCameras.end(); ++it)
     {
         if ((*it)->GetDni() != dni)
@@ -1503,6 +1524,9 @@ EndpointId AddBridgedDeviceEndpoint(Device * dev, Span<DataVersion> dataVersions
 {
     VerifyOrReturnValue(dev != nullptr, kInvalidEndpointId);
 
+    // Shared with the camera family's AddCameraEndpoint/RemoveCameraByDni: see
+    // gDeviceTableMutex's comment at its declaration above.
+    std::lock_guard<std::mutex> tableLock(gDeviceTableMutex);
     // Slot 0 is the Aggregator; bridged devices (cameras and Tuya) occupy slots 1+.
     for (uint8_t index = 1; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++index)
     {
@@ -1560,6 +1584,9 @@ bool RemoveBridgedDeviceEndpoint(Device * dev, const std::function<void()> & onE
 {
     VerifyOrReturnValue(dev != nullptr, false);
 
+    // Shared with the camera family's AddCameraEndpoint/RemoveCameraByDni: see
+    // gDeviceTableMutex's comment at its declaration above.
+    std::lock_guard<std::mutex> tableLock(gDeviceTableMutex);
     for (uint8_t index = 1; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++index)
     {
         if (gDevices[index] != dev)
