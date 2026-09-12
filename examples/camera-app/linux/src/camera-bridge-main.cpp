@@ -36,6 +36,7 @@
 // is absent (single-camera bring-up / backward-compat).
 
 #ifdef HAVE_TUYA
+#include "tuya-bridge-endpoints.h"
 #include "tuya/tuya_runtime.h"
 #endif
 
@@ -1479,6 +1480,106 @@ CameraAppCommandDelegate sCameraAppCommandDelegate;
 
 } // namespace
 
+#ifdef HAVE_TUYA
+// ---------------------------------------------------------------------------
+// Tuya (non-camera) bridged endpoints — slot-table seam.
+//
+// tuya-bridge-endpoints.cpp implements the hubm_* C API but must NOT own any of the
+// dynamic-endpoint state: cameras and Tuya devices share one gDevices slot table so the
+// two can never collide on a slot or an endpoint id. These two functions are the only
+// window into that state; everything else about a Tuya device lives in the other file.
+//
+// Both mutators take StackLock directly (never ScheduleWork — the POSIX event loop
+// dispatches scheduled work with the non-recursive stack mutex held) and are called from
+// Tuya worker threads, exactly like the ONVIF IPC accept thread does for cameras.
+// ---------------------------------------------------------------------------
+namespace TuyaBridge {
+
+static_assert(kBridgedDeviceClusterCount == MATTER_ARRAY_SIZE(sBridgedCameraClusters),
+              "TuyaBridge::kBridgedDeviceClusterCount must match the shared bridged-endpoint cluster list");
+
+EndpointId AddBridgedDeviceEndpoint(Device * dev, Span<DataVersion> dataVersions, Span<const EmberAfDeviceType> deviceTypes,
+                                    const std::function<void(EndpointId)> & onEndpointReady)
+{
+    VerifyOrReturnValue(dev != nullptr, kInvalidEndpointId);
+
+    // Slot 0 is the Aggregator; bridged devices (cameras and Tuya) occupy slots 1+.
+    for (uint8_t index = 1; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++index)
+    {
+        if (gDevices[index] != nullptr)
+            continue;
+
+        gDevices[index] = dev;
+
+        while (true)
+        {
+            StackLock lock;
+            dev->SetEndpointId(gCurrentEndpointId);
+            dev->SetParentEndpointId(gAggregatorEndpointId);
+
+            // The ember endpoint template is the same Descriptor-only one the cameras use:
+            // all functional clusters are registry-based, so only the device type list differs.
+            CHIP_ERROR err = emberAfSetDynamicEndpoint(index, gCurrentEndpointId, &sBridgedCameraEndpoint, dataVersions,
+                                                       deviceTypes, gAggregatorEndpointId);
+            if (err == CHIP_NO_ERROR)
+            {
+                const EndpointId assigned = gCurrentEndpointId;
+                ChipLogProgress(DeviceLayer, "TuyaBridge: '%s' -> endpoint %u (slot %u)", dev->GetName(), assigned, index);
+
+                if (dev->GetUniqueId()[0] == '\0')
+                    dev->GenerateUniqueId();
+
+                LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(
+                    dev->CreateBridgedDeviceInfo(assigned, { .reachable = true, .nodeLabel = dev->GetName() },
+                                                 { .uniqueId              = dev->GetUniqueId(),
+                                                   .softwareVersion       = static_cast<uint32_t>(1),
+                                                   .softwareVersionString = std::string("1.0") })));
+
+                onEndpointReady(assigned);
+                return assigned;
+            }
+
+            if (err != CHIP_ERROR_ENDPOINT_EXISTS)
+            {
+                ChipLogError(DeviceLayer, "TuyaBridge: emberAfSetDynamicEndpoint failed: %" CHIP_ERROR_FORMAT, err.Format());
+                gDevices[index] = nullptr;
+                return kInvalidEndpointId;
+            }
+
+            // Endpoint ID collision — try the next one.
+            if (++gCurrentEndpointId < gFirstDynamicEndpointId)
+                gCurrentEndpointId = gFirstDynamicEndpointId;
+        }
+    }
+
+    ChipLogError(DeviceLayer, "TuyaBridge: all %d dynamic slots are full", CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT);
+    return kInvalidEndpointId;
+}
+
+bool RemoveBridgedDeviceEndpoint(Device * dev, const std::function<void()> & onEndpointCleared)
+{
+    VerifyOrReturnValue(dev != nullptr, false);
+
+    for (uint8_t index = 1; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; ++index)
+    {
+        if (gDevices[index] != dev)
+            continue;
+
+        {
+            StackLock lock;
+            dev->Unregister();                  // BridgedDeviceBasicInformation
+            emberAfClearDynamicEndpoint(index); // drop the endpoint from the data model
+            gDevices[index] = nullptr;
+            onEndpointCleared(); // functional clusters, while the stack is quiesced
+        }
+        return true;
+    }
+    return false;
+}
+
+} // namespace TuyaBridge
+#endif // HAVE_TUYA
+
 // ---------------------------------------------------------------------------
 // ApplicationInit / ApplicationShutdown (called by ChipLinuxAppMainLoop)
 // ---------------------------------------------------------------------------
@@ -1658,7 +1759,10 @@ void ApplicationInit()
 void ApplicationShutdown()
 {
 #ifdef HAVE_TUYA
+    // Stop the cloud runtime first so no worker/Pulsar thread can call hubm_* while the
+    // Tuya endpoints below are torn down, then drop the endpoints themselves.
     tuya_runtime_stop();
+    TuyaBridge::Shutdown();
 #endif
     // Stop accepting IPC requests first and join the accept thread, so no upsert/
     // remove can mutate the camera list while we tear it down below.

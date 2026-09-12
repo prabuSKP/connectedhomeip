@@ -242,5 +242,34 @@ executable("chip-camera-bridge-app") {
     "${chip_root}/third_party/libdatachannel:libdatachannel",
   ]
 
+  if (tuya_cloud_enabled) {
+    # Tuya non-camera bridged endpoints (hubm_* API). Source + cluster deps are added
+    # ONLY here, so a tuya_cloud_enabled=false build is completely unaffected.
+    sources += [
+      "src/tuya-bridge-endpoints.cpp",
+      "src/tuya-clusters.cpp",
+    ]
+
+    # Code-driven (ZAP-independent, per-endpoint) cluster servers. The camera-app ZAP
+    # data model has none of these clusters, so the registry implementations are what
+    # make the commands actually work on a dynamic endpoint.
+    deps += [
+      "${chip_root}/src/app/clusters/boolean-state-server",
+      "${chip_root}/src/app/clusters/level-control",
+      "${chip_root}/src/app/clusters/occupancy-sensor-server",
+      "${chip_root}/src/app/clusters/on-off-server",
+      "${chip_root}/src/app/clusters/temperature-measurement-server",
+
+      # Generated cluster objects for the clusters whose upstream server is still
+      # ember/ZAP-bound (ColorControl, Thermostat, WindowCovering, FanControl) or absent
+      # (RelativeHumidityMeasurement) — those are implemented in src/tuya-clusters.cpp.
+      "${chip_root}/zzz_generated/app-common/clusters/ColorControl",
+      "${chip_root}/zzz_generated/app-common/clusters/FanControl",
+      "${chip_root}/zzz_generated/app-common/clusters/RelativeHumidityMeasurement",
+      "${chip_root}/zzz_generated/app-common/clusters/Thermostat",
+      "${chip_root}/zzz_generated/app-common/clusters/WindowCovering",
+    ]
+  }
+
   output_dir = root_out_dir
 }
